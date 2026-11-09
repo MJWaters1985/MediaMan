@@ -150,8 +150,9 @@ def summarize(data: dict | None) -> dict:
         # constant frame rate (needed for resumable chunked encodes) and exact frame count when the file has one
         "cfr": (_num(v.get("r_frame_rate")) or 0) > 0
                and abs((_num(v.get("r_frame_rate")) or 0) - (_num(v.get("avg_frame_rate")) or _num(v.get("r_frame_rate")) or 0)) < 0.01,
+        # statistics tags are only hints: a stream-copied file can carry the original's values
         "frames": _frame_count(v),
-        "vduration": _num(v.get("duration")) or _vtag_duration(v) or duration,
+        "vduration": _num(v.get("duration")) or (_vtag_duration(v) if abs(_vtag_duration(v) - duration) < 2 else duration),
         "vstart": max(0.0, (_num(v.get("start_time")) or 0.0) - (_num(fmt.get("start_time")) or 0.0)),
         "pix_fmt": pix, "bit_depth": depth,
         "vbitrate": int(vbit or 0),

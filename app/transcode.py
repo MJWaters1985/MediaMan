@@ -862,14 +862,34 @@ class Worker:
         fps, n_per = exact_fps(s), chunk_frames(s)
         ext = RAW_FORMAT[codec][1]
         name = os.path.basename(path)
-        expected = s.get("frames") or round((s.get("vduration") or s.get("duration") or 0) * fps)
+        q = shlex.quote
+        if not state.get("src_frames"):
+            # exact count of the source's video frames (reads the whole file once, no decoding); tags can be stale
+            db.x("UPDATE jobs SET message=? WHERE id=?", ("counting source frames", jid))
+            # packets in the whole file, minus frames the decoder discards at the very start (a file cut on an
+            # open GOP begins with frames that reference the missing previous GOP)
+            cnt, head = os.path.join(wd, "frames.txt"), os.path.join(wd, "head.txt")
+            fp = q(probe.FFPROBE)
+            ok, err = await self._sh(jid, f"{fp} -v error -select_streams V:0 -count_packets "
+                                          f"-show_entries stream=nb_read_packets -of csv=p=0 {q(path)} > {q(cnt)} && "
+                                          f"{fp} -v error -select_streams V:0 -read_intervals %+10 -count_packets "
+                                          f"-count_frames -show_entries stream=nb_read_packets,nb_read_frames "
+                                          f"-of json {q(path)} > {q(head)}")
+            try:
+                total = int(open(cnt).read().strip().strip(",").split()[0])
+                h = json.load(open(head))["streams"][0]
+                state["src_frames"] = total - max(0, int(h["nb_read_packets"]) - int(h["nb_read_frames"]))
+            except (OSError, ValueError, IndexError, KeyError):
+                ok = False
+            if not ok:
+                return False if jid in self.cancelled else self._fail(f"couldn't count source frames: {err[-300:]}")
+        expected = state["src_frames"]
         dur = expected / fps
         total_chunks = max(1, -(-expected // n_per))
         state.update(crf=crf, vmaf=plan.get("vmaf"))
         state.setdefault("chunks", [])
         self._save_state(wd, state)
         video = os.path.join(wd, "video" + ext)
-        q = shlex.quote
         if not state.get("joined"):
             chunks = state["chunks"]
             done = sum(chunks)
@@ -917,10 +937,8 @@ class Worker:
                 except OSError:
                     pass
         frames = sum(state["chunks"])
-        if s.get("frames") and frames != s["frames"]:
-            plan["frame_problem"] = f"frame count changed ({s['frames']} → {frames})"
-        elif not s.get("frames") and abs(frames - expected) > 2:
-            plan["frame_problem"] = f"frame count changed (~{expected} → {frames})"
+        if frames != expected:      # a misplaced chunk join would add or lose a frame there (audio drifts)
+            plan["frame_problem"] = f"frame count changed ({expected} → {frames})"
         js = plan.get("hdr10plus_json")
         if js and not state.get("injected"):
             db.x("UPDATE jobs SET message=? WHERE id=?", ("injecting HDR10+ metadata", jid))
