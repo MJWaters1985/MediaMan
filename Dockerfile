@@ -1,6 +1,10 @@
 # MediaMan — Jellyfin/qBittorrent media manager with hardware transcoding.
 # jellyfin-ffmpeg ships the Intel media driver (QSV/VAAPI), Mesa (AMD VAAPI) and NVENC support.
 FROM python:3.12-slim-trixie
+LABEL org.opencontainers.image.title="MediaMan" \
+      org.opencontainers.image.description="Organizes, imports and transcodes a Jellyfin media library" \
+      org.opencontainers.image.authors="Mike Waters (MJWaters1985)" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
 
 ARG JELLYFIN_FFMPEG=jellyfin-ffmpeg7
 RUN apt-get update \

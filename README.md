@@ -232,3 +232,28 @@ The code lives in `app/`: `identify.py` (hints), `naming.py` (Jellyfin paths and
 `organizer.py` (scan, propose, apply), `watcher.py` (downloads), `transcode.py` (hardware
 detection, planning, queue), `integrations.py` (Jellyfin lookups and refresh, qBittorrent), `main.py` (API), and
 `static/` (UI).
+
+## License
+
+Copyright (C) 2026 Mike Waters ([@MJWaters1985](https://github.com/MJWaters1985))
+
+MediaMan is free software: you can redistribute it and/or modify it under the terms of the GNU General
+Public License as published by the Free Software Foundation, either version 3 of the License, or (at
+your option) any later version (`GPL-3.0-or-later`). It is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; see [LICENSE](LICENSE) for the full text.
+
+### Software bundled in the container image
+
+The image installs these tools unmodified from their publishers; their source code is available from
+the links below.
+
+| Component | License | Source |
+|---|---|---|
+| jellyfin-ffmpeg 7 (FFmpeg built with GPL v3 parts, incl. x264, x265, SVT-AV1) | GPL-3.0 | [jellyfin/jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) |
+| MKVToolNix (Debian package) | GPL-2.0-or-later | [mkvtoolnix.download](https://mkvtoolnix.download/source.html), [Debian sources](https://sources.debian.org/src/mkvtoolnix/) |
+| VMAF | BSD-2-Clause-Patent | [Netflix/vmaf](https://github.com/Netflix/vmaf) |
+| dovi_tool | MIT | [quietvoid/dovi_tool](https://github.com/quietvoid/dovi_tool) |
+| hdr10plus_tool | MIT | [quietvoid/hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool) |
+| Python 3.12 and Debian base packages | various free licenses | [Debian sources](https://sources.debian.org/) |
+
+Python dependencies are listed in `requirements.txt` with their versions.
