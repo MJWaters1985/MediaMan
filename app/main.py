@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config, db, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 PASSWORD = os.environ.get("MEDIAMAN_PASSWORD", "")
 
@@ -85,7 +85,8 @@ def status():
         "items": counts("SELECT status, COUNT(*) n FROM items WHERE source='scan' GROUP BY status"),
         "imports": counts("SELECT status, COUNT(*) n FROM imports GROUP BY status"),
         "saved_bytes": (db.one("SELECT SUM(orig_size - new_size) s FROM jobs WHERE status='done'") or {}).get("s") or 0,
-        "candidates": (db.one("SELECT COUNT(*) n FROM items WHERE source='scan' AND transcode_hint LIKE '%→%' AND status='ok'") or {})["n"],
+        "candidates": (db.one("SELECT COUNT(*) n FROM items WHERE source='scan' AND transcode_hint LIKE '%→%' AND status='ok' "
+                                   "AND NOT EXISTS (SELECT 1 FROM transcode_skips k WHERE k.path=items.path AND k.size=items.size)") or {})["n"],
         "paths": paths,
         "tls": {k: v for k, v in tls.state.items() if k != "sig"},
         "ffmpeg": probe.FFMPEG,
@@ -122,6 +123,8 @@ async def redetect():
 def _item_out(r: dict) -> dict:
     r = dict(r)
     r["info"] = db.jload(r["info"]) or {}
+    k = db.one("SELECT size, reason FROM transcode_skips WHERE path=?", (r["path"],))
+    r["skipped"] = k["reason"] if k and k["size"] == r["size"] else None
     return r
 
 
@@ -266,15 +269,19 @@ def list_jobs(status: str = "", limit: int = 300):
 
 @app.post("/api/jobs")
 def add_jobs(body: dict = Body(...)):
-    paths = list(body.get("paths") or [])
+    # Files picked explicitly are retried even if an earlier attempt wasn't worth keeping;
+    # "all candidates" leaves those out.
+    paths = [(p, True) for p in body.get("paths") or []]
     for i in body.get("item_ids") or []:
         it = db.one("SELECT path FROM items WHERE id=?", (int(i),))
         if it:
-            paths.append(it["path"])
+            paths.append((it["path"], True))
     if body.get("all_candidates"):
-        paths += [r["path"] for r in db.q(
-            "SELECT path FROM items WHERE source='scan' AND transcode_hint LIKE '%→%' AND status='ok' ORDER BY size DESC")]
-    n = sum(1 for p in paths if transcode.enqueue(p, int(body.get("priority", 0)), bool(body.get("force"))))
+        paths += [(r["path"], False) for r in db.q(
+            "SELECT path FROM items WHERE source='scan' AND transcode_hint LIKE '%→%' AND status='ok' "
+            "AND NOT EXISTS (SELECT 1 FROM transcode_skips k WHERE k.path=items.path AND k.size=items.size) ORDER BY size DESC")]
+    n = sum(1 for p, explicit in paths
+            if transcode.enqueue(p, int(body.get("priority", 0)), bool(body.get("force")), retry_skipped=explicit))
     return {"queued": n}
 
 

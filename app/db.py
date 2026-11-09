@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS imports (
     status TEXT,                              -- waiting | imported | review | failed | ignored | empty
     message TEXT,
     created REAL, updated REAL);
+-- files whose transcode was skipped for too little savings; ignored again only while size+mtime match
+CREATE TABLE IF NOT EXISTS transcode_skips (
+    path TEXT PRIMARY KEY, size INTEGER, mtime REAL, reason TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS tmdb_cache (q TEXT PRIMARY KEY, data TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS log (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, level TEXT, area TEXT, msg TEXT);

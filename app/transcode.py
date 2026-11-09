@@ -487,9 +487,39 @@ def protected(path: str) -> bool:
     return a.startswith(b)
 
 
-def enqueue(path: str, priority: int = 0, force: bool = False) -> int | None:
+def _stat(path: str) -> tuple[int, float] | None:
+    try:
+        st = os.stat(path)
+        return st.st_size, st.st_mtime
+    except OSError:
+        return None
+
+
+def remember_skip(path: str, reason: str):
+    st = _stat(path)
+    if st:
+        db.x("INSERT OR REPLACE INTO transcode_skips(path, size, mtime, reason, ts) VALUES(?,?,?,?,?)",
+             (path, st[0], st[1], reason, time.time()))
+
+
+def skipped_before(path: str) -> str | None:
+    """Reason a previous transcode of this exact file was not worth keeping, or None.
+    A replaced or re-written file (different size or mtime) no longer matches."""
+    row = db.one("SELECT size, mtime, reason FROM transcode_skips WHERE path=?", (path,))
+    if not row:
+        return None
+    st = _stat(path)
+    if st and st[0] == row["size"] and abs(st[1] - row["mtime"]) < 1:
+        return row["reason"]
+    db.x("DELETE FROM transcode_skips WHERE path=?", (path,))
+    return None
+
+
+def enqueue(path: str, priority: int = 0, force: bool = False, retry_skipped: bool = False) -> int | None:
     if protected(path):
         db.log("warn", "transcode", f"refused to queue a file in the downloads folder: {path}")
+        return None
+    if not (force or retry_skipped) and skipped_before(path):
         return None
     if db.one("SELECT id FROM jobs WHERE path=? AND status IN ('queued','running','paused')", (path,)):
         return None
@@ -649,13 +679,16 @@ class Worker:
         min_save = float(config.get("min_savings_pct") or 0) / 100
         if not problem and new_size > orig_size * (1 - min_save) and not force:
             os.unlink(tmp)
+            msg = f"result only {100 - new_size * 100 // max(orig_size, 1)}% smaller — kept original"
+            remember_skip(path, msg)
             db.x("UPDATE jobs SET status='skipped', progress=1, new_size=?, finished=?, message=? WHERE id=?",
-                 (new_size, time.time(), f"result only {100 - new_size * 100 // max(orig_size, 1)}% smaller — kept original", jid))
+                 (new_size, time.time(), msg, jid))
             return
         if problem:
             os.unlink(tmp)
             raise RuntimeError("verification failed: " + problem)
         final = await asyncio.to_thread(self._replace, path, tmp, plan["output"])
+        db.x("DELETE FROM transcode_skips WHERE path IN (?,?)", (path, final))
         saved = 100 - new_size * 100 // max(orig_size, 1)
         q = plan.get("vmaf")
         qtxt = f", CRF {q['crf']} (VMAF {q['score']:.1f})" if q else (f", CRF {plan['crf']}" if plan.get("crf") else "")

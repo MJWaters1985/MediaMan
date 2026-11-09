@@ -115,3 +115,22 @@ def test_hdr_crf_ceiling():
     assert transcode.crf_range("hevc", S(**UHD)) == (14, 22)
     assert transcode.crf_range("av1", S(**UHD)) == (16, 28)
     assert transcode.crf_range("av1", S()) == (16, 34)
+
+
+def test_skipped_files_are_remembered(tmp_path):
+    from app import db
+    config.update({"downloads_dir": str(tmp_path / "dl")})
+    f = tmp_path / "movie.mkv"
+    f.write_bytes(b"x" * 100)
+    transcode.remember_skip(str(f), "result only 9% smaller — kept original")
+    assert transcode.skipped_before(str(f))
+    assert transcode.enqueue(str(f)) is None                          # auto / queue-all
+    jid = transcode.enqueue(str(f), retry_skipped=True)               # picked explicitly
+    assert jid
+    db.x("DELETE FROM jobs WHERE id=?", (jid,))
+    assert transcode.enqueue(str(f), force=True)
+    db.x("DELETE FROM jobs")
+    f.write_bytes(b"y" * 120)                                         # file replaced → candidate again
+    assert transcode.skipped_before(str(f)) is None
+    assert transcode.enqueue(str(f))
+    db.x("DELETE FROM jobs")
