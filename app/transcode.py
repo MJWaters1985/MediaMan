@@ -1018,7 +1018,10 @@ class Worker:
             raise
         if jid in self.cancelled:
             return False, "cancelled"
-        return proc.returncode == 0, (err or out or b"").decode(errors="ignore")
+        msg = (err or out or b"").decode(errors="ignore")
+        if proc.returncode in (137, -9):
+            msg = "a step was killed (signal 9) — usually the system running out of memory; " + msg[-300:]
+        return proc.returncode == 0, msg
 
     async def _postprocess_hevc(self, jid: int, plan: dict, s: dict):
         """Single-pass encodes: pull the HEVC stream out, convert DV to 8.1 and/or inject HDR10+, remux."""
@@ -1130,6 +1133,8 @@ class Worker:
 
         async def drain():
             async for line in proc.stderr:
+                if line.startswith((b"Svt[info]", b"x265 [info]")):   # encoder banners, not errors
+                    continue
                 err_buf.append(line)
                 del err_buf[:-40]
         dtask = asyncio.create_task(drain())
@@ -1168,6 +1173,10 @@ class Worker:
         err = b"".join(err_buf).decode(errors="ignore").strip()
         if jid in self.cancelled:
             return False, "cancelled"
+        if rc < 0:
+            err = (f"the encoder was killed by signal {-rc}"
+                   + (" — usually the system running out of memory" if -rc == signal.SIGKILL else "")
+                   + (f"; last output: {err[-300:]}" if err else ""))
         return rc == 0, err or f"exit code {rc}"
 
 
