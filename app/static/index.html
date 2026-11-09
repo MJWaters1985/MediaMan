@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediaMan</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%234f7cff'/><path d='M9 22V10l7 7 7-7v12' stroke='white' stroke-width='3' fill='none' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">M</span> MediaMan</div>
+  <nav id="tabs">
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="library">Library</button>
+    <button data-tab="imports">Downloads</button>
+    <button data-tab="queue">Transcode queue</button>
+    <button data-tab="settings">Settings</button>
+    <button data-tab="log">Log</button>
+  </nav>
+</header>
+<main>
+  <section id="overview" class="tab active"></section>
+  <section id="library" class="tab">
+    <div class="toolbar">
+      <div class="chips" id="lib-filters">
+        <button data-f="proposed,unknown,conflict,error" class="active">Needs attention</button>
+        <button data-f="ok">Organized</button>
+        <button data-f="transcode">Transcode candidates</button>
+        <button data-f="ignored">Ignored</button>
+        <button data-f="">All</button>
+      </div>
+      <input id="lib-search" type="search" placeholder="Filter by path…">
+      <span class="spacer"></span>
+      <button id="lib-scan" class="primary">Scan library</button>
+    </div>
+    <div class="toolbar sub" id="lib-bulk">
+      <label><input type="checkbox" id="lib-all"> Select all</label>
+      <button data-bulk="apply">Apply selected</button>
+      <button data-bulk="apply-high">Apply all ≥ 80% confidence</button>
+      <button data-bulk="transcode">Transcode selected</button>
+      <button data-bulk="ignore">Ignore selected</button>
+      <span class="muted" id="lib-count"></span>
+    </div>
+    <div id="lib-table"></div>
+  </section>
+  <section id="imports" class="tab">
+    <div class="toolbar">
+      <span class="muted" id="watch-state"></span>
+      <span class="spacer"></span>
+      <button id="poll-now">Check downloads now</button>
+    </div>
+    <div id="imports-list"></div>
+  </section>
+  <section id="queue" class="tab">
+    <div class="toolbar">
+      <button id="q-toggle"></button>
+      <button id="q-candidates">Queue all candidates</button>
+      <span class="muted" id="q-state"></span>
+      <span class="spacer"></span>
+      <button id="q-clear">Clear finished</button>
+    </div>
+    <div id="queue-list"></div>
+  </section>
+  <section id="settings" class="tab"></section>
+  <section id="log" class="tab">
+    <div class="toolbar"><div class="chips" id="log-filters">
+      <button data-l="" class="active">All</button><button data-l="info">Info</button>
+      <button data-l="warn">Warnings</button><button data-l="error">Errors</button></div></div>
+    <div id="log-list"></div>
+  </section>
+</main>
+
+<dialog id="dlg"><form method="dialog" id="dlg-form"></form></dialog>
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
