@@ -604,7 +604,7 @@ def make_plan(path: str, s: dict, force: bool = False, crf: int | None = None) -
         plan["note"] = ((plan.get("note") + "; ") if plan.get("note") else "") + \
             f"encoded in {CHUNK_SECONDS // 60 or 1}-minute chunks, so a restart resumes where it stopped"
     plan.update(backend=backend, codec=codec, crf=crf if backend == "software" else None, tmp=tmp,
-                workdir=base + ".mediaman-work", attempts=attempts, expect=expect,
+                workdir=base + WORK_SUFFIX, attempts=attempts, expect=expect,
                 search=backend == "software" and vmaf_enabled() and codec in ("av1", "hevc"),
                 hdr10plus_json=(base + ".mediaman-work/hdr10plus.json") if s.get("hdr10plus") else None,
                 output=os.path.splitext(path)[0] + ".mkv")
@@ -810,6 +810,11 @@ class Worker:
         if not plan["transcode"]:
             db.x("UPDATE jobs SET status='skipped', message=?, progress=1, finished=? WHERE id=?",
                  (plan["reason"], time.time(), jid))
+            # an earlier run may have left chunks (e.g. the Dolby Vision setting changed mid-film)
+            freed = remove_workdir(plan["workdir"])
+            if freed:
+                db.log("info", "transcode", f"{os.path.basename(path)}: skipped — removed {freed / 1024 ** 3:.1f} GB "
+                                            f"of work files from an earlier run")
             return
         problem = space_problem(path, s, plan, orig_size)
         if problem:
@@ -1306,6 +1311,55 @@ class Worker:
                    + (" — usually the system running out of memory" if -rc == signal.SIGKILL else "")
                    + (f"; last output: {err[-300:]}" if err else ""))
         return rc == 0, err or f"exit code {rc}"
+
+
+WORK_SUFFIX = ".mediaman-work"
+ORPHAN_AGE = 2 * 86400      # a work folder untouched this long with no job waiting for it is removed
+
+
+def workdir_for(path: str) -> str:
+    return os.path.join(os.path.dirname(path), "." + os.path.splitext(os.path.basename(path))[0] + WORK_SUFFIX)
+
+
+def remove_workdir(wd: str) -> int:
+    """Delete a work folder; returns the bytes freed (0 if there was none)."""
+    if not os.path.isdir(wd):
+        return 0
+    size = 0
+    for dirpath, _, files in os.walk(wd):
+        for f in files:
+            try:
+                size += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                pass
+    shutil.rmtree(wd, ignore_errors=True)
+    return size
+
+
+def sweep_workdirs(roots: list[str], now: float | None = None) -> tuple[int, int]:
+    """Remove work folders no queued/running/paused job will use: left by a job cancelled while queued, a file
+    deleted mid-job, a job that failed and was never retried. A folder is kept while it's younger than
+    ORPHAN_AGE, so a failed job retried within that time still resumes. Returns (folders, bytes) removed."""
+    now = now or time.time()
+    active = {workdir_for(r["path"]) for r in db.q("SELECT path FROM jobs WHERE status IN ('queued','running','paused')")}
+    n = freed = 0
+    for root in roots:
+        for dirpath, dirnames, _ in os.walk(root):
+            keep = []
+            for d in dirnames:
+                full = os.path.join(dirpath, d)
+                if d.startswith(".") and d.endswith(WORK_SUFFIX):
+                    try:
+                        age = now - max(os.path.getmtime(os.path.join(full, f)) for f in os.listdir(full) or ["."])
+                    except (OSError, ValueError):
+                        age = now - os.path.getmtime(full)
+                    if full not in active and age > ORPHAN_AGE:
+                        freed += remove_workdir(full)
+                        n += 1
+                elif not d.startswith((".", "@")) and d != "#recycle":
+                    keep.append(d)
+            dirnames[:] = keep
+    return n, freed
 
 
 def expected_output(s: dict, codec: str, orig_size: int) -> int:

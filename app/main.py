@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth, config, db, fsbrowse, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="MediaMan", version=VERSION)
@@ -76,6 +76,10 @@ async def _housekeeping_loop():
             r = await asyncio.to_thread(db.housekeeping)
             if any(r.values()):
                 db.log("info", "app", "housekeeping: removed " + ", ".join(f"{n} old {k}" for k, n in r.items() if n))
+            folders, freed = await asyncio.to_thread(transcode.sweep_workdirs, [d for d, _ in organizer.roots()])
+            if folders:
+                db.log("info", "app", f"housekeeping: removed {folders} leftover transcode work folder"
+                                      f"{'s' if folders != 1 else ''} ({freed / 1024 ** 3:.1f} GB)")
         except Exception as e:
             db.log("warn", "app", f"housekeeping failed: {e}")
         await asyncio.sleep(86400)

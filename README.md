@@ -102,7 +102,9 @@ GPU encodes, variable-frame-rate video and AV1 Dolby Vision still run as a singl
 nothing new; *Resume queue* continues it from the same frame. The pause is saved, so it survives a
 restart. A job can also be paused on its own. Outside the *Only run between* window (e.g.
 `01:00-07:00`) the running job is frozen the same way and continues when the window opens.
-Cancelling a job deletes its work folder.
+Cancelling a job deletes its work folder, and so does a job that turns out to be skipped (for example
+after a settings change). The daily clean-up also removes any work folder that no waiting job will use
+and that hasn't been touched for 2 days, so a failed job retried within that time still resumes.
 
 **Restarts and shutdowns:** stopping the app, restarting the app pool or shutting down the NAS sends
 MediaMan the normal container stop signal. It shuts down in about a second and keeps the finished

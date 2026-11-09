@@ -65,3 +65,49 @@ def test_queue_paused_at_startup_when_resume_is_off():
     transcode.startup_queue_policy()
     assert transcode.worker.paused is True                        # off: comes back paused
     config.update({"queue_paused": False, "resume_queue_on_startup": True})
+
+
+
+def test_leftover_work_folders_are_removed(tmp_path):
+    import os
+    import time
+    from app import db, transcode
+    lib = tmp_path / "lib"
+    keepers, orphans = [], []
+    for name, active, old in (("Busy", True, True), ("Gone", False, True), ("Fresh", False, False)):
+        d = lib / f"{name} (2000)"
+        d.mkdir(parents=True)
+        src = d / f"{name} (2000).mkv"
+        src.write_bytes(b"x")
+        wd = transcode.workdir_for(str(src))
+        os.makedirs(wd)
+        open(os.path.join(wd, "c00000.obu"), "wb").write(b"y" * 1000)
+        if old:
+            t = time.time() - 3 * 86400
+            os.utime(os.path.join(wd, "c00000.obu"), (t, t))
+        if active:
+            db.x("INSERT INTO jobs(path, status, created) VALUES(?, 'queued', ?)", (str(src), time.time()))
+        (orphans if (old and not active) else keepers).append(wd)
+    n, freed = transcode.sweep_workdirs([str(lib)])
+    assert n == 1 and freed == 1000
+    assert all(not os.path.exists(w) for w in orphans) and all(os.path.isdir(w) for w in keepers)
+    db.x("DELETE FROM jobs WHERE path LIKE ?", (str(lib) + "%",))
+
+
+def test_skipped_job_removes_its_chunks(tmp_path, monkeypatch):
+    import asyncio
+    import os
+    from app import db, probe, transcode
+    src = tmp_path / "Film (2001).mkv"
+    src.write_bytes(b"x")
+    wd = transcode.workdir_for(str(src))
+    os.makedirs(wd)
+    open(os.path.join(wd, "c00000.hevc"), "wb").write(b"z" * 5000)
+    monkeypatch.setattr(probe, "ffprobe", lambda *a, **k: {})
+    monkeypatch.setattr(probe, "summarize", lambda d: {})
+    monkeypatch.setattr(transcode, "make_plan", lambda p, s, f: {"transcode": False, "reason": "kept as is",
+                                                                 "workdir": wd})
+    jid = db.x("INSERT INTO jobs(path, status, created) VALUES(?, 'running', 0)", (str(src),))
+    asyncio.run(transcode.worker._run(jid, str(src), False))
+    assert db.one("SELECT status FROM jobs WHERE id=?", (jid,))["status"] == "skipped"
+    assert not os.path.exists(wd)
