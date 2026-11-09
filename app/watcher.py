@@ -148,7 +148,8 @@ def poll() -> None:
 async def loop():
     last_refresh = 0.0
     while True:
-        if config.get("watcher_enabled"):
+        # nothing is imported until the setup wizard is done (its folders and rules may not be right yet)
+        if config.get("watcher_enabled") and config.get("setup_done"):
             try:
                 await asyncio.to_thread(poll)
             except Exception as e:

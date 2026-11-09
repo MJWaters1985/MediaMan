@@ -116,7 +116,7 @@ def test_settings_migration(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "_settings", None)
     s = config.load()
     assert s["target_codec"] == "auto" and s["preferred_backend"] == "software" and s["hdr_policy"] == "transcode"
-    assert s["movies_dir"] == "/x" and json.loads(f.read_text())["settings_version"] == 3
+    assert s["movies_dir"] == "/x" and json.loads(f.read_text())["settings_version"] == 4
 
 
 def test_hdr_crf_ceiling():
@@ -223,6 +223,7 @@ def test_new_defaults_dont_change_existing_installs(tmp_path, monkeypatch):
     s = config.load()
     assert s["keep_originals"] is True and s["auto_transcode_imports"] is False
     assert s["dv_policy"] == "mel_only" and s["device_path"] == "" and s["encoder_priority"] == "low"
+    assert s["setup_done"] is False and s["movies_dir"] == "/media/Movies"
     monkeypatch.setattr(config, "_settings", None)
 
 
@@ -274,3 +275,16 @@ def test_gpu_is_picked_by_working_encoders(monkeypatch):
         assert transcode.pick_device() == "/dev/dri/renderD128"  # an explicit choice wins
     finally:
         config.update({"device_path": ""})
+
+
+
+def test_existing_installs_skip_the_setup_wizard(tmp_path, monkeypatch):
+    import json
+    f = tmp_path / "settings.json"
+    f.write_text(json.dumps({"settings_version": 3, "movies_dir": "/data/Media/Movies"}))
+    monkeypatch.setattr(config, "SETTINGS_FILE", str(f))
+    monkeypatch.setattr(config, "_settings", None)
+    s = config.load()
+    assert s["setup_done"] is True and s["movies_dir"] == "/data/Media/Movies"
+    assert s["tv_dir"] == "/media/tv" and s["downloads_dir"] == "/downloads"     # old defaults kept
+    monkeypatch.setattr(config, "_settings", None)

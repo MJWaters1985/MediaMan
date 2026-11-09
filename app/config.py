@@ -14,13 +14,15 @@ MASK = "••••••••"
 
 DEFAULTS: dict = {
     # Library layout (paths as seen inside the container)
-    "movies_dir": "/media/movies",
-    "tv_dir": "/media/tv",
+    # one Media mount holding library and downloads (hardlinks need both on the same mount); the setup
+    # wizard picks the real folders inside it
+    "movies_dir": "/media/Movies",
+    "tv_dir": "/media/Shows",
     "movies_more_dirs": [],         # more Movies folders (other pools/datasets); files there stay where they are
     "tv_more_dirs": [],             # more TV folders
     "extra_scan_dirs": [],          # unsorted folders to scan; proposals move files into movies/tv
     # qBittorrent finished-downloads watcher
-    "downloads_dir": "/downloads",
+    "downloads_dir": "/media/Downloads",
     "watcher_enabled": True,
     "watcher_interval": 60,         # seconds between polls
     "watcher_settle_seconds": 120,  # files must be unchanged this long before import
@@ -59,7 +61,8 @@ DEFAULTS: dict = {
     "keep_originals": True,         # move replaced originals to <dir>/.mediaman-trash instead of deleting
     "encoder_priority": "low",      # low (nice 10, lowest best-effort I/O) | normal
     "device_path": "",              # empty: pick the GPU whose encoders work
-    "settings_version": 3,
+    "setup_done": False,            # the first-run setup wizard has been completed or skipped
+    "settings_version": 4,
 }
 
 # keys whose defaults changed in a settings_version bump (older saved values are replaced once)
@@ -67,7 +70,9 @@ MIGRATIONS = {2: ("target_codec", "preferred_backend", "hdr_policy", "quality_bi
 # defaults that changed in settings_version 3: an existing install that never saved these keeps the old
 # behaviour instead of silently switching (new installs get the new defaults)
 PRESERVE = {3: {"keep_originals": False, "auto_transcode_imports": True, "dv_policy": "convert",
-                "device_path": "/dev/dri/renderD128"}}
+                "device_path": "/dev/dri/renderD128"},
+            4: {"movies_dir": "/media/movies", "tv_dir": "/media/tv", "downloads_dir": "/downloads",
+                "setup_done": True}}
 
 _lock = threading.Lock()
 _settings: dict | None = None

@@ -4,6 +4,11 @@ All notable changes to MediaMan. Versions follow [semantic versioning](https://s
 
 ## Unreleased
 
+- First-run setup wizard: folders (with the folder picker and a write check), Jellyfin and qBittorrent
+  (with Test buttons), automation and safety settings, and an optional password. The downloads watcher
+  waits until it's finished or skipped. Existing installs skip it.
+- New installs expect one Media mount at `/media` holding the library and downloads (so imports can
+  hardlink); existing installs keep their folder settings.
 - Licensed under GPL-3.0-or-later; the README lists the tools bundled in the image with their licenses.
 - GitHub Actions: tests run on every push; a version tag builds, tests and publishes the image to
   `ghcr.io`.

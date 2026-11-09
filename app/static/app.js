@@ -392,7 +392,7 @@ async function folderPicker(start, onPick) {
 
 function renderSettings() {
   const s = SETTINGS;
-  $("#settings").innerHTML = passwordCard() + `<form id="set-form">${FIELDS.map(([title, fields]) => `
+  $("#settings").innerHTML = `<div class="toolbar"><span class="spacer"></span><button type="button" class="link" id="rerun-setup">Run the setup wizard again</button></div>` + passwordCard() + `<form id="set-form">${FIELDS.map(([title, fields]) => `
     <div class="card settings-group"><h3>${esc(title)}</h3><div class="form">
     ${fields.map(([k, label, type, hint, test]) => {
       let input;
@@ -411,6 +411,7 @@ function renderSettings() {
       return `<label>${esc(label)}</label>${input}${hint ? `<div class="hint">${esc(hint)}</div>` : ""}`;
     }).join("")}</div></div>`).join("")}
     <div class="toolbar"><button class="primary" type="submit">Save settings</button></div></form>`;
+  $("#rerun-setup").onclick = () => startSetup();
   const pw = $("#pw-form");
   if (pw) {
     pw.onsubmit = (e) => {
@@ -455,10 +456,157 @@ async function loadLog() {
   setHTML($("#log-list"), `<div class="card" style="padding:0">${rows.map((r) => `<div class="log-row"><span class="muted">${new Date(r.ts * 1000).toLocaleString()}</span> <span class="lv-${r.level}">${r.level.toUpperCase()}</span> <b>${esc(r.area)}</b> ${esc(r.msg)}</div>`).join("") || '<div class="empty">No log entries.</div>'}</div>`);
 }
 
+
+// ---------------------------------------------------------------- first-run setup wizard
+let SETUP = null;      // {step} while the wizard is open
+const SETUP_STEPS = ["Welcome", "Folders", "Jellyfin", "qBittorrent", "Automation", "Password"];
+
+function setupField(k, label, type, hint, extra = "") {
+  const s = SETTINGS, v = s[k];
+  let input;
+  if (type === "bool") input = `<label style="color:var(--text)"><input type="checkbox" name="${k}" ${v ? "checked" : ""}> ${extra || "on"}</label>`;
+  else if (type.startsWith("select:")) input = `<select name="${k}">${type.slice(7).split("|").map((o) => { const [val, lab] = o.split("="); return `<option value="${esc(val)}" ${String(v) === val ? "selected" : ""}>${esc(lab || val)}</option>`; }).join("")}</select>`;
+  else if (type === "folder") input = `<div style="display:flex;gap:6px"><input style="flex:1" name="${k}" value="${esc(v ?? "")}" autocomplete="off"><button type="button" class="small" data-browse="${k}">Browse…</button></div>`;
+  else input = `<div style="display:flex;gap:6px"><input style="flex:1" name="${k}" type="${type === "secret" ? "password" : "text"}" value="${esc(v ?? "")}" autocomplete="off"${extra ? ` placeholder="${esc(extra)}"` : ""}></div>`;
+  return `<label>${esc(label)}</label>${input}${hint ? `<div class="hint">${hint}</div>` : ""}`;
+}
+
+function setupStep(n) {
+  switch (n) {
+    case 0: return `<h2>Welcome to MediaMan</h2>
+      <p>MediaMan keeps a Jellyfin library tidy: it names files the way Jellyfin expects, brings in finished
+      downloads, and can shrink files by transcoding them while keeping HDR, Dolby Vision, every audio track and every subtitle.</p>
+      <p>This setup takes a couple of minutes. Nothing is renamed, imported or transcoded until you've finished it,
+      and everything here can be changed later under Settings.</p>`;
+    case 1: return `<h2>Folders</h2>
+      <p class="muted">Pick the folders Jellyfin uses for movies and shows, and the folder your download client puts finished downloads in.
+      Browse lists the folders mounted into MediaMan.</p>
+      <div class="form">
+        ${setupField("movies_dir", "Movies", "folder", "")}
+        ${setupField("tv_dir", "Shows", "folder", "")}
+        ${setupField("downloads_dir", "Finished downloads", "folder", "MediaMan never changes or transcodes files here; it copies or links them into the library.")}
+        ${setupField("import_mode", "Bring downloads in by", "select:copy=copying (keeps them seeding; uses extra space)|hardlink=hardlinking (keeps seeding, no extra space; same dataset and mount only)|move=moving (stops seeding)", "")}
+      </div><div id="setup-folder-check" class="muted" style="margin-top:10px"></div>`;
+    case 2: return `<h2>Jellyfin <span class="muted" style="font-weight:400">(optional)</span></h2>
+      <p class="muted">With Jellyfin connected, MediaMan tells it which files changed and uses its TMDb search to confirm titles. Create an API key in Jellyfin under Dashboard → API Keys.</p>
+      <div class="form">
+        ${setupField("jellyfin_url", "Jellyfin address", "text", "", "https://nas.example:8920")}
+        ${setupField("jellyfin_api_key", "API key", "secret", "")}
+        ${setupField("jellyfin_verify_tls", "Check its HTTPS certificate", "bool", "Turn off only for a self-signed certificate.")}
+        <label></label><div><button type="button" data-test="jellyfin">Test connection</button> <span id="test-jellyfin" class="muted"></span></div>
+      </div>`;
+    case 3: return `<h2>qBittorrent <span class="muted" style="font-weight:400">(optional)</span></h2>
+      <p class="muted">MediaMan works with any download client: it waits until a download's files stop changing. With qBittorrent's Web UI connected, it also waits until qBittorrent reports the download complete.</p>
+      <div class="form">
+        ${setupField("qbittorrent_url", "Web UI address", "text", "", "http://nas.example:8080")}
+        ${setupField("qbittorrent_username", "User name", "text", "")}
+        ${setupField("qbittorrent_password", "Password", "secret", "")}
+        <label></label><div><button type="button" data-test="qbittorrent">Test connection</button> <span id="test-qbittorrent" class="muted"></span></div>
+      </div>`;
+    case 4: return `<h2>Automation and safety</h2>
+      <p class="muted">These start cautious. You can loosen them once you've seen how MediaMan handles your files.</p>
+      <div class="form">
+        ${setupField("auto_import_min_confidence", "Import downloads automatically", "select:0.9=When at least 90% sure of the title|0.75=When at least 75% sure (recommended)|0.6=When at least 60% sure|2=Never — always ask me", "Less certain downloads wait under Downloads for you to check.")}
+        ${setupField("auto_transcode_imports", "Transcode imports automatically", "bool", "Off: you choose what to transcode from the Library.", "transcode every import")}
+        ${setupField("keep_originals", "Keep originals", "bool", "A transcoded file's original moves to a hidden .mediaman-trash folder instead of being deleted. Uses space until you empty it.", "keep them")}
+        ${setupField("dv_policy", "Dolby Vision", "select:mel_only=Convert, except profile 7 FEL (recommended)|convert=Convert everything to profile 8.1|skip=Never transcode Dolby Vision", "Profile 7 FEL discs carry extra picture detail that converting removes; most streaming players ignore it anyway.")}
+      </div>`;
+    case 5: return `<h2>Password <span class="muted" style="font-weight:400">(optional)</span></h2>
+      <p class="muted">Without a password, anyone who can reach this page can rename and transcode your files. Your browser will ask for it; any user name works.</p>
+      <div class="form">
+        <label>Password</label><input type="password" name="setup_pw" autocomplete="new-password">
+        <label>Repeat</label><input type="password" name="setup_pw2" autocomplete="new-password">
+        <div class="hint">At least 8 characters. Leave empty to skip; you can set one later in Settings.</div>
+      </div>`;
+  }
+}
+
+const SETUP_FIELDS = {1: ["movies_dir", "tv_dir", "downloads_dir", "import_mode"],
+  2: ["jellyfin_url", "jellyfin_api_key", "jellyfin_verify_tls"], 3: ["qbittorrent_url", "qbittorrent_username", "qbittorrent_password"],
+  4: ["auto_import_min_confidence", "auto_transcode_imports", "keep_originals", "dv_policy"]};
+
+function setupValues(form, step) {
+  const out = {};
+  for (const k of SETUP_FIELDS[step] || []) {
+    const el = form[k]; if (!el) continue;
+    out[k] = el.type === "checkbox" ? el.checked : k === "auto_import_min_confidence" ? Number(el.value) : el.value;
+  }
+  return out;
+}
+
+async function checkFolders(form) {
+  const box = $("#setup-folder-check"); if (!box) return;
+  const rows = [];
+  for (const [k, label] of [["movies_dir", "Movies"], ["tv_dir", "Shows"], ["downloads_dir", "Finished downloads"]]) {
+    const p = form[k].value.trim();
+    if (!p) { rows.push(`${label}: <span class="bad">not set</span>`); continue; }
+    const d = await api("/api/fs?path=" + encodeURIComponent(p)).catch((e) => ({ error: e.message }));
+    rows.push(`${label}: ${d.error ? `<span class="bad">${esc(d.error)}</span>` : d.writable ? '<span class="ok">✓ found, writable</span>' : '<span class="warn">found, but MediaMan can\'t write to it</span>'}`);
+  }
+  box.innerHTML = rows.join("<br>");
+}
+
+function renderSetup() {
+  const n = SETUP.step, last = SETUP_STEPS.length - 1;
+  $("#setup").innerHTML = `<div class="setup card">
+    <div class="setup-steps">${SETUP_STEPS.map((s, i) => `<span class="${i === n ? "on" : i < n ? "done" : ""}">${i + 1}. ${esc(s)}</span>`).join("")}</div>
+    <form id="setup-form" autocomplete="off">${setupStep(n)}</form>
+    <div class="dlg-actions">
+      <button type="button" id="setup-skip" class="link" style="margin-right:auto">Skip setup</button>
+      ${n ? '<button type="button" id="setup-back">Back</button>' : ""}
+      <button type="button" id="setup-next" class="primary">${n === 0 ? "Start" : n === last ? "Finish" : "Next"}</button>
+    </div></div>`;
+  const f = $("#setup-form");
+  $$("[data-browse]", f).forEach((b) => b.onclick = () => folderPicker(f[b.dataset.browse].value.trim(), (p) => { f[b.dataset.browse].value = p; checkFolders(f); }));
+  if (n === 1) { checkFolders(f); $$("input", f).forEach((i) => i.onchange = () => checkFolders(f)); }
+  $$("[data-test]", f).forEach((b) => b.onclick = async () => {
+    const out = $("#test-" + b.dataset.test); out.textContent = "testing…";
+    try { SETTINGS = await api("/api/settings", { method: "PUT", body: setupValues(f, n) }); } catch (e) { out.textContent = "⚠ " + e.message; return; }
+    const r = await api(`/api/settings/test/${b.dataset.test}`, { method: "POST" }).catch((e) => ({ result: e.message }));
+    out.textContent = r.result;
+  });
+  $("#setup-skip").onclick = () => finishSetup(false);
+  if ($("#setup-back")) $("#setup-back").onclick = () => { SETUP.step--; renderSetup(); };
+  $("#setup-next").onclick = async () => {
+    try {
+      if (SETUP_FIELDS[n]) SETTINGS = await api("/api/settings", { method: "PUT", body: setupValues(f, n) });
+    } catch (e) { toast("⚠ " + e.message); return; }
+    if (n < last) { SETUP.step++; renderSetup(); return; }
+    const pw = f.setup_pw.value;
+    if (pw || f.setup_pw2.value) {
+      if (pw.length < 8) return toast("⚠ Use at least 8 characters, or leave both fields empty");
+      if (pw !== f.setup_pw2.value) return toast("⚠ The passwords don't match");
+    }
+    finishSetup(true, pw);
+  };
+}
+
+async function finishSetup(completed, password = "") {
+  try {
+    SETTINGS = await api("/api/settings", { method: "PUT", body: { setup_done: true } });
+    if (password) await api("/api/auth/password", { method: "POST", body: { current: "", new: password } });
+  } catch (e) { toast("⚠ " + e.message); return; }
+  SETUP = null;
+  document.body.classList.remove("in-setup");
+  if (password) { toast("Password set — sign in when your browser asks"); setTimeout(() => location.replace("/#overview"), 1200); return; }
+  showTab("overview");
+  if (completed && confirm("Setup done. Scan your library now? It only reads files and suggests renames; nothing changes until you approve.")) {
+    act(() => api("/api/scan", { method: "POST", body: {} }), "Library scan started");
+  }
+}
+
+function startSetup() {
+  SETUP = { step: 0 };
+  document.body.classList.add("in-setup");
+  tab = "setup";
+  $$(".tab").forEach((s) => s.classList.toggle("active", s.id === "setup"));
+  renderSetup();
+}
+
 // ---------------------------------------------------------------- refresh loop
 let busy = false;
 async function refresh(force) {
-  if (busy) return; busy = true;
+  if (busy || SETUP) return; busy = true;
   try {
     STATUS = await api("/api/status");
     if (force || !SETTINGS.movies_dir) SETTINGS = await api("/api/settings");
@@ -471,4 +619,7 @@ async function refresh(force) {
   } catch (e) { console.error(e); } finally { busy = false; }
 }
 setInterval(() => { if (!$("#dlg").open && tab !== "settings") refresh(); }, 3000);
-showTab(tab);
+(async () => {
+  try { SETTINGS = await api("/api/settings"); } catch (e) { console.error(e); }
+  if (SETTINGS.setup_done === false) startSetup(); else showTab(tab === "setup" ? "overview" : tab);
+})();

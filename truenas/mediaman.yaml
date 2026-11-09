@@ -3,9 +3,9 @@
 # Before installing:
 #   1. Build the image on the NAS:  sudo sh truenas/build-on-nas.sh   (creates mediaman:latest)
 #   2. Replace every /mnt/POOL/... path below with your real host paths:
-#        - the same folders your Jellyfin app uses for its Movies and Shows libraries
-#        - the folder qBittorrent saves FINISHED downloads to
 #        - a dataset/folder for MediaMan's own config + database
+#        - one folder that contains your Jellyfin Movies and Shows folders AND qBittorrent's finished
+#          downloads (one mount lets imports use hardlinks); the setup wizard picks the folders inside it
 #   3. Check the GPU groups: `ls -ln /dev/dri` on the NAS shows the group IDs of card0/renderD128
 #      (TrueNAS is normally 44 = video, 107 = render). Keep them in group_add below.
 #
@@ -34,9 +34,7 @@ services:
       - "8765:8765"
     volumes:
       - /mnt/POOL/apps/mediaman:/config
-      - /mnt/POOL/MEDIA/Movies:/media/movies
-      - /mnt/POOL/MEDIA/Shows:/media/tv
-      - /mnt/POOL/DOWNLOADS/complete:/downloads
+      - /mnt/POOL/MEDIA:/media
     # NVIDIA GPU instead of /dev/dri? Install the NVIDIA driver (Apps → Configuration → Settings),
     # remove `devices`/`group_add` above and uncomment:
     # deploy:

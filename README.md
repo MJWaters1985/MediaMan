@@ -128,19 +128,17 @@ single-pass encode moves on to its next attempt.
    ```
 
 3. Edit `truenas/mediaman.yaml` and replace the `/mnt/POOL/...` paths with:
-   - the folders your Jellyfin app mounts for Movies and Shows
-   - qBittorrent's finished-downloads folder
    - a folder for MediaMan's config and database
+   - one folder that contains your Jellyfin Movies and Shows folders and your finished downloads,
+     mounted at `/media` (a single mount lets imports use hardlinks)
 
    Check the `group_add` IDs with `ls -ln /dev/dri`. For NVIDIA, use the commented `deploy` block.
 4. **Apps → Discover Apps → ⋮ → Install via YAML**, name it `mediaman`, and paste the YAML.
-5. Open `http://<nas>:8765`. Under **Settings → Folders**, use **Browse…** to pick the Movies, TV and
-   downloads folders (the picker lists only folders mounted into MediaMan and shows whether each is
-   writable). Then check **Overview → Folders** (each one should show *writable*) and **Hardware**.
-6. Optional, under **Settings**:
-   - Jellyfin URL and API key: library refresh after imports and transcodes, and title lookups
-     (Jellyfin's TMDb search confirms titles and years and adds TMDb IDs).
-   - qBittorrent Web UI login: only import torrents that qBittorrent reports complete.
+5. Open `http://<nas>:8765`. A setup wizard walks through the folders (picked with **Browse…** from
+   what's mounted, each checked for write access), Jellyfin and qBittorrent (each with a Test
+   button), the automation and safety settings, and an optional password. Nothing is imported or
+   renamed until it's finished or skipped; **Settings → Run the setup wizard again** reopens it.
+6. Check **Overview → Folders** (each one should show *writable*) and **Hardware**.
 
 ### Several pools or datasets
 
