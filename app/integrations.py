@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import threading
 import time
 
 import httpx
@@ -127,6 +128,91 @@ def jellyfin_refresh() -> bool:
     except Exception as e:
         db.log("warn", "jellyfin", f"refresh failed: {e}")
         return False
+
+
+_changes: dict[str, str] = {}
+_changes_lock = threading.Lock()
+_folders = {"ts": 0.0, "locations": []}
+
+
+def jellyfin_changed(path: str, kind: str = "Modified") -> None:
+    """Remember a library change (Created / Modified / Deleted) for the next batched Jellyfin update."""
+    if path:
+        with _changes_lock:
+            _changes[path] = kind
+
+
+def jellyfin_pending() -> bool:
+    return bool(_changes)
+
+
+def _jf_locations() -> list[str]:
+    """Jellyfin's own library folders (its paths can differ from MediaMan's: other container, other mounts)."""
+    if time.time() - _folders["ts"] < 600:
+        return _folders["locations"]
+    r = httpx.get(_jf_url() + "/Library/VirtualFolders", headers=_jf_headers(), timeout=15,
+                  verify=config.get("jellyfin_verify_tls"))
+    r.raise_for_status()
+    locs = [loc for f in r.json() for loc in (f.get("Locations") or [])]
+    _folders.update(ts=time.time(), locations=locs)
+    return locs
+
+
+def map_to_jellyfin(path: str, mine: list[str], theirs: list[str]) -> str | None:
+    """The same file as Jellyfin sees it. A MediaMan library folder matches the Jellyfin folder with the longest
+    run of identical trailing folder names (/data/Media/Movies ↔ /Media/Movies); ties or no match → None."""
+    for root in sorted(mine, key=len, reverse=True):
+        r = root.rstrip("/")
+        if path != r and not path.startswith(r + "/"):
+            continue
+        rp = [p for p in r.split("/") if p]
+        best, best_n, tie = None, 0, False
+        for loc in theirs:
+            lp = [p for p in loc.rstrip("/").split("/") if p]
+            n = 0
+            while n < min(len(rp), len(lp)) and rp[-1 - n] == lp[-1 - n]:
+                n += 1
+            if n > best_n:
+                best, best_n, tie = loc.rstrip("/"), n, False
+            elif n == best_n and n:
+                tie = True
+        if best and not tie:
+            return best + path[len(r):]
+        return None
+    return None
+
+
+def jellyfin_flush() -> bool:
+    """Tell Jellyfin exactly which files changed (it rescans just those folders). Falls back to a full library
+    refresh when a path can't be matched to one of Jellyfin's folders."""
+    with _changes_lock:
+        changes = dict(_changes)
+        _changes.clear()
+    url, key = _jf_url(), config.get("jellyfin_api_key")
+    if not changes or not url or not key:
+        return False
+    from .organizer import library_dirs
+    mine = library_dirs("movies") + library_dirs("tv")
+    try:
+        theirs = _jf_locations()
+        updates = []
+        for p, kind in changes.items():
+            jp = map_to_jellyfin(p, mine, theirs)
+            if jp is None:
+                db.log("info", "jellyfin", f"couldn't match {p} to a Jellyfin library folder — refreshing the "
+                                           f"whole library instead")
+                return jellyfin_refresh()
+            updates.append({"Path": jp, "UpdateType": kind})
+        r = httpx.post(url + "/Library/Media/Updated", headers=_jf_headers(), json={"Updates": updates}, timeout=15,
+                       verify=config.get("jellyfin_verify_tls"))
+        if r.status_code >= 400:
+            db.log("warn", "jellyfin", f"update failed: {_jf_explain(r)} — refreshing the whole library instead")
+            return jellyfin_refresh()
+        db.log("info", "jellyfin", f"told Jellyfin about {len(updates)} changed file{'s' if len(updates) != 1 else ''}")
+        return True
+    except Exception as e:
+        db.log("warn", "jellyfin", f"update failed: {e} — refreshing the whole library instead")
+        return jellyfin_refresh()
 
 
 def jellyfin_test() -> str:

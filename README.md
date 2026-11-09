@@ -50,9 +50,13 @@ codec that keeps every bit of HDR, and target "no visible loss".
 | Source | Output | Why |
 |---|---|---|
 | SDR, HDR10, HLG | AV1 (SVT-AV1, 10-bit) | most efficient; mastering display + MaxCLL/MaxFALL kept |
-| Dolby Vision 7 / 8 | HEVC (x265) Dolby Vision **8.1** | the DV form today's TVs play; HDR10 base kept (a profile 7 FEL is dropped) |
+| Dolby Vision 8, profile 7 MEL | HEVC (x265) Dolby Vision **8.1** | the DV form today's TVs play; HDR10 base kept |
+| Dolby Vision profile 7 FEL | left alone (default) | its full enhancement layer is real extra picture detail that a single-layer file can't keep. Settings → Dolby Vision `convert` converts these too |
 | HDR10+ | HEVC (x265) + HDR10+ | dynamic metadata extracted and re-injected with `hdr10plus_tool`, remuxed with `mkvmerge` |
 | DV profile 5, already-efficient HEVC/AV1 | left alone | |
+
+Whether a profile 7 file is FEL or MEL is read from its first frames with `dovi_tool` when the file is
+scanned; the Library shows it (e.g. `DV7 FEL`).
 
 HDR titles always use the CPU encoders: GPU encoders can't carry the HDR metadata.
 
@@ -155,6 +159,25 @@ single-pass encode moves on to its next attempt.
 The Log tab keeps the newest 5,000 entries. A daily clean-up also drops expired title lookups and
 cached file details for files that no longer exist. Each entry is also printed once to the app's
 TrueNAS log; TrueNAS doesn't rotate container logs, so MediaMan never prints encoder output there.
+
+### Sharing the NAS
+
+- **CPU and memory limits** set for the app in TrueNAS are respected: encoder thread counts come from
+  the container's real limit, not the host's core count. The AV1 encoder's memory grows with its
+  parallelism (about 3 GB at the lowest level and 6 GB at level 4 for a 4K encode; its own automatic
+  setting reached 18 GB on a 24-thread machine), so MediaMan picks the highest level that fits in half
+  the memory limit, shared between parallel jobs. Overview → Hardware shows the CPUs and memory it sees.
+- **Encoder priority** (Settings → Transcoding, default *low*): encoders run at `nice 10` and the lowest
+  best-effort disk priority, so file shares and Jellyfin playback stay responsive. Encodes only slow
+  down while the NAS is busy with something else.
+- **GPU**: with *GPU render node* empty, MediaMan tests each GPU at startup and uses the one whose
+  encoders work (on a machine with an integrated and a dedicated GPU that isn't always `renderD128`).
+- **Jellyfin** is told exactly which files changed (`/Library/Media/Updated`), at most once a minute,
+  instead of rescanning the whole library. MediaMan matches its folders to Jellyfin's by name, since
+  the two apps usually see the library under different paths (e.g. `/data/Media/Movies` and
+  `/Media/Movies`); if a file can't be matched, it falls back to a full library refresh.
+- **New-install defaults** are the cautious ones: Keep originals on, transcoding imports off, profile 7
+  FEL left alone. An existing install keeps whatever it had.
 
 ### Password
 

@@ -86,7 +86,7 @@ function renderOverview() {
       <div class="kv">
         <div>Codec policy</div><div><b>${esc(s.target_codec === "auto" ? "auto (AV1 / HEVC for DV & HDR10+)" : (s.target_codec || "").toUpperCase())}</b></div>
         <div>GPU</div><div>${(hw.devices || []).map((d) => `${esc(d.vendor)} <span class="path">${esc(d.path)}</span>`).join("<br>") || "none passed through"}</div>
-        <div>CPU threads</div><div>${hw.cpu_count || "?"}</div>
+        <div>CPU threads</div><div>${hw.cpu_count || "?"}${hw.memory ? ` · ${(hw.memory / 1024 ** 3).toFixed(0)} GB memory` : ""}</div>
         <div>Tools</div><div>${Object.entries(hw.tools || {}).map(([k, v]) => `${esc(k)} ${v ? "✓" : "✗"}`).join(" · ")}</div>
         ${encRows}
       </div>
@@ -301,8 +301,8 @@ const FIELDS = [
   ["Downloads watcher", [
     ["watcher_enabled", "Watch downloads", "bool", ""],
     ["import_mode", "Import by", "select:copy|hardlink|move", "Copy keeps the torrent seeding. Hardlink only works when downloads and library share one host-path mount."],
-    ["auto_import_min_confidence", "Auto-import confidence", "number", "0–1. Below this a download waits for your review."],
-    ["auto_transcode_imports", "Transcode imports automatically", "bool", ""],
+    ["auto_import_min_confidence", "Import downloads automatically", "choice:0.9=When at least 90% sure of the title|0.75=When at least 75% sure (recommended)|0.6=When at least 60% sure|2=Never — always ask me", "Downloads MediaMan is less sure about wait under Downloads for you to check. The Library shows how sure it is about each file."],
+    ["auto_transcode_imports", "Transcode imports automatically", "bool", "Off: imports are only queued when you choose to transcode them."],
     ["watcher_interval", "Check every (s)", "number", ""],
     ["watcher_settle_seconds", "Settle time (s)", "number", "Files must be unchanged this long before importing."],
     ["min_video_size_mb", "Min video size (MB)", "number", "Smaller videos in a download are treated as samples."],
@@ -310,7 +310,7 @@ const FIELDS = [
   ["Naming", [
     ["naming_include_ids", "Add [tmdbid-…] to folders", "bool", "Helps Jellyfin match exactly. Needs Jellyfin lookups or an existing ID."],
     ["naming_include_episode_title", "Episode titles in file names", "bool", ""],
-    ["auto_apply_scan_min_confidence", "Auto-apply scan proposals ≥", "number", "0 = always wait for approval."],
+    ["auto_apply_scan_min_confidence", "Rename library files automatically", "choice:0=Never — always ask me (recommended)|0.95=When at least 95% sure of the title|0.9=When at least 90% sure|0.8=When at least 80% sure", "After a library scan, renames MediaMan is this sure about happen without asking; the rest wait in the Library for your approval."],
   ]],
   ["Transcoding", [
     ["target_codec", "Codec", "select:auto|av1|hevc|h264", "auto: AV1 (most efficient) for SDR/HDR10/HLG; HEVC for Dolby Vision and HDR10+ so players keep the dynamic HDR."],
@@ -321,14 +321,15 @@ const FIELDS = [
     ["quality_bias", "CRF bias (fixed mode)", "number", "Only used when the VMAF target is 0: added to the default CRF."],
     ["max_height", "Max height", "number", "0 keeps the source resolution."],
     ["hdr_policy", "HDR10 / HLG", "select:transcode|skip", "transcode keeps 10-bit, colour tags, mastering display and light levels."],
-    ["dv_policy", "Dolby Vision", "select:convert|skip", "convert: profile 7/8 → HEVC profile 8.1 (HDR10 base + DV metadata; the profile 7 enhancement layer is dropped)."],
+    ["dv_policy", "Dolby Vision", "select:mel_only|convert|skip", "Everything converts to HEVC profile 8.1 (HDR10 base + DV metadata). mel_only: profile 7 discs with a full enhancement layer (FEL) are left alone, because converting drops that extra picture detail; MEL discs and profile 8 convert. convert: all of them. skip: none."],
     ["audio_policy", "Audio", "select:copy|eac3_lossless", "eac3_lossless converts TrueHD/DTS-HD/FLAC/PCM to EAC3 640k."],
     ["min_savings_pct", "Min savings (%)", "number", "Results that save less are discarded and the original kept."],
     ["concurrent_jobs", "Parallel jobs", "number", ""],
     ["resume_queue_on_startup", "Resume transcoding after a restart", "bool", "On: after MediaMan, the app or the NAS restarts, interrupted jobs continue (chunked encodes from their last finished chunk). Off: the queue comes back paused until you press Resume queue. A queue you paused yourself stays paused either way."],
     ["transcode_window", "Only run between", "text", "e.g. 01:00-07:00. Empty = any time. Outside the window a running job is frozen mid-film and continues when it reopens."],
     ["keep_originals", "Keep originals", "bool", "Move replaced files into .mediaman-trash in the library instead of deleting them."],
-    ["device_path", "GPU render node", "text", ""],
+    ["encoder_priority", "Encoder priority", "select:low|normal", "low: encoders yield CPU and disk to everything else on the NAS (file shares, Jellyfin playback). Encodes only slow down when the NAS is busy."],
+    ["device_path", "GPU render node", "text", "Empty: use the GPU whose encoders work (checked at startup)."],
   ]],
   ["Integrations (optional)", [
     ["jellyfin_url", "Jellyfin URL", "text", "e.g. https://nas.example:8920 — refreshes the library after changes and looks up titles."],
@@ -396,6 +397,12 @@ function renderSettings() {
     ${fields.map(([k, label, type, hint, test]) => {
       let input;
       if (type === "bool") input = `<label style="color:var(--text)"><input type="checkbox" name="${k}" ${s[k] ? "checked" : ""}> enabled</label>`;
+      else if (type.startsWith("choice:")) {
+        const opts = type.slice(7).split("|").map((o) => o.split("="));
+        const cur = Number(s[k]);
+        if (!opts.some(([v]) => Number(v) === cur)) opts.push([String(cur), `Custom (${Math.round(cur * 100)}%)`]);
+        input = `<select name="${k}">${opts.map(([v, l]) => `<option value="${esc(v)}" ${Number(v) === cur ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
+      }
       else if (type.startsWith("select:")) input = `<select name="${k}">${type.slice(7).split("|").map((o) => `<option ${s[k] === o ? "selected" : ""}>${o}</option>`).join("")}</select>`;
       else if (type === "lines") input = `<textarea name="${k}" rows="3">${esc((s[k] || []).join("\n"))}</textarea>`;
       else if (type === "folders") input = `<div style="display:flex;gap:6px;align-items:flex-start"><textarea style="flex:1" name="${k}" rows="3">${esc((s[k] || []).join("\n"))}</textarea><button type="button" class="small" data-browse="${k}" data-add="1">Add folder…</button></div>`;
@@ -422,7 +429,7 @@ function renderSettings() {
   $("#set-form").onsubmit = async (e) => {
     e.preventDefault();
     const body = {};
-    FIELDS.flatMap((g) => g[1]).forEach(([k, , type]) => { const el = e.target[k]; body[k] = type === "bool" ? el.checked : type === "number" ? Number(el.value) : el.value; });
+    FIELDS.flatMap((g) => g[1]).forEach(([k, , type]) => { const el = e.target[k]; body[k] = type === "bool" ? el.checked : (type === "number" || type.startsWith("choice:")) ? Number(el.value) : el.value; });
     SETTINGS = await act(() => api("/api/settings", { method: "PUT", body }), "Settings saved") || SETTINGS;
   };
   $$("[data-browse]").forEach((b) => b.onclick = () => {

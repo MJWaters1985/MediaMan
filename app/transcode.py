@@ -33,7 +33,6 @@ BAD_SUBS = {"eia_608", "dvb_teletext", "bin_data", "timed_id3"}
 LOSSLESS_AUDIO = {"truehd", "flac", "mlp", "alac"}
 
 hw: dict = {"detected": False}
-needs_jellyfin_refresh = {"flag": False}
 
 
 # ================================================================ hardware detection
@@ -89,6 +88,82 @@ def _x265_hdr10plus() -> bool:
         return False
 
 
+def limits() -> dict:
+    """CPUs and memory this container may actually use. os.cpu_count() is the whole host's count even when
+    TrueNAS limits the app to a few CPUs; the cgroup files hold the real limits."""
+    cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4)
+    try:
+        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()[:2]
+        if quota != "max":
+            cpus = min(cpus, max(1, -(-int(quota) // int(period))))
+    except (OSError, ValueError):
+        pass
+    mem = None
+    try:
+        with open("/proc/meminfo") as f:
+            mem = next(int(l.split()[1]) * 1024 for l in f if l.startswith("MemTotal:"))
+    except (OSError, StopIteration, ValueError):
+        pass
+    try:
+        v = open("/sys/fs/cgroup/memory.max").read().strip()
+        if v != "max":
+            mem = min(mem or int(v), int(v))
+    except (OSError, ValueError):
+        pass
+    return {"cpus": max(1, cpus), "memory": mem}
+
+
+# SVT-AV1 peak memory per "level of parallelism" for a 4K 10-bit encode at preset 5 (measured: 2.9 / 3.7 /
+# 4.8 / 6.1 GB for levels 1-4; 5-6 extrapolated). Smaller frames need proportionally less.
+SVT_LP_GB_4K = {1: 3.0, 2: 3.8, 3: 4.9, 4: 6.2, 5: 8.0, 6: 10.0}
+
+
+def svt_level(s: dict) -> int:
+    """The AV1 encoder's parallelism level: as high as the CPUs justify, as low as memory requires (half the
+    memory limit, shared between parallel jobs). Its own automatic setting sizes itself to the core count
+    alone — about 18 GB at 4K on a 24-thread machine."""
+    lim = limits()
+    cpus = lim["cpus"]
+    level = 1 if cpus <= 2 else 2 if cpus <= 4 else 3 if cpus <= 8 else 4 if cpus <= 16 else 5 if cpus <= 32 else 6
+    if lim["memory"]:
+        budget = lim["memory"] / 2 / max(1, int(config.get("concurrent_jobs") or 1)) / 1024 ** 3
+        px = (s.get("width") or 3840) * (s.get("height") or 2160)
+        scale = max(0.3, px / (3840 * 2160))
+        while level > 1 and SVT_LP_GB_4K[level] * scale > budget:
+            level -= 1
+    return level
+
+
+def _priority_prefix() -> list[str]:
+    """Encoders run at low CPU and I/O priority so the NAS (shares, Jellyfin playback) stays responsive."""
+    if config.get("encoder_priority") == "normal":
+        return []
+    out = ["nice", "-n", "10"] if shutil.which("nice") else []
+    if shutil.which("ionice"):
+        out += ["ionice", "-c2", "-n7"]
+    return out
+
+
+def _render_nodes() -> list[str]:
+    return sorted(f"/dev/dri/{n}" for n in os.listdir("/dev/dri") if n.startswith("renderD")) \
+        if os.path.isdir("/dev/dri") else []
+
+
+def pick_device() -> str | None:
+    """The configured render node, or (setting empty) the one whose hardware encoders work best — on a
+    machine with an integrated and a dedicated GPU the encoder isn't always renderD128."""
+    nodes = _render_nodes()
+    want = config.get("device_path")
+    if want and want in nodes:
+        return want
+    best, best_score = (nodes[0] if nodes else None), -1
+    for d in nodes:
+        score = sum(2 if c == "hevc" else 1 for c in ("hevc", "av1", "h264") if _probe_encoder("vaapi", c, 8, d))
+        if score > best_score:
+            best, best_score = d, score
+    return best
+
+
 def detect_hardware() -> dict:
     try:
         enc_list = subprocess.run([probe.FFMPEG, "-hide_banner", "-encoders"], capture_output=True,
@@ -97,11 +172,9 @@ def detect_hardware() -> dict:
         hw.clear()
         hw.update(detected=True, error=f"ffmpeg not usable: {e}", backends={}, best={})
         return hw
-    dev = config.get("device_path") or "/dev/dri/renderD128"
-    dri = sorted(f"/dev/dri/{n}" for n in os.listdir("/dev/dri")) if os.path.isdir("/dev/dri") else []
-    if dev not in dri and dri:
-        dev = next((d for d in dri if "renderD" in d), dev)
-    devices = [{"path": d, "vendor": _dri_vendor(d)} for d in dri if "renderD" in d]
+    dri = _render_nodes()
+    dev = pick_device() or "/dev/dri/renderD128"
+    devices = [{"path": d, "vendor": _dri_vendor(d)} for d in dri]
     has_nvidia = os.path.exists("/dev/nvidia0") or os.path.exists("/dev/nvidiactl")
     if has_nvidia:
         devices.append({"path": "/dev/nvidia0", "vendor": "nvidia"})
@@ -129,8 +202,10 @@ def detect_hardware() -> dict:
         if caps:
             backends[b] = caps
     hw.clear()
+    lim = limits()
     hw.update(detected=True, ts=time.time(), device=dev, vendor=vendor, devices=devices,
-              cpu_count=os.cpu_count(), backends=backends, x265_hdr10plus=_x265_hdr10plus(),
+              device_auto=not config.get("device_path"), cpu_count=lim["cpus"], memory=lim["memory"],
+              backends=backends, x265_hdr10plus=_x265_hdr10plus(),
               tools={k: bool(v) for k, v in TOOLS.items()})
     hw["best"] = {c: next((b for b in BACKEND_ORDER if c in backends.get(b, {})), None)
                   for c in ("hevc", "av1", "h264")}
@@ -174,7 +249,7 @@ def codec_for(s: dict) -> str:
 def _hdr_kind(s: dict) -> str:
     parts = []
     if s.get("dovi"):
-        parts.append(f"DV{s.get('dv_profile') or ''}")
+        parts.append(f"DV{s.get('dv_profile') or ''}" + (f" {s['dv_el']}" if s.get("dv_el") else ""))
     if s.get("hdr10plus"):
         parts.append("HDR10+")
     elif s.get("hdr"):
@@ -202,6 +277,12 @@ def assess(s: dict, force: bool = False) -> tuple[bool, str]:
             return False, f"{label} — H.264 can't carry Dolby Vision"
         if tgt == "hevc" and not (TOOLS["dovi_tool"] and TOOLS["mkvmerge"]):
             return False, f"{label} — Dolby Vision conversion tools (dovi_tool, mkvmerge) unavailable"
+        if s.get("dv_profile") == 7 and config.get("dv_policy") == "mel_only" and not force:
+            if s.get("dv_el") == "FEL":
+                return False, (f"{label} — kept as is: converting would drop its full enhancement layer "
+                               f"(Dolby Vision setting: profile 7 MEL only)")
+            if s.get("dv_el") != "MEL":
+                return False, f"{label} — kept as is: couldn't tell whether its enhancement layer is FEL or MEL"
     if s.get("hdr10plus"):
         if tgt != "hevc":
             return False, f"{label} — HDR10+ only survives as HEVC; set codec to auto or hevc"
@@ -266,7 +347,7 @@ def _software_args(codec: str, depth: int, q: int, s: dict, full: bool = True) -
     hdr = bool(s.get("hdr"))
     dv = bool(s.get("dovi")) and full
     if codec == "av1":
-        params = ["tune=0", "enable-variance-boost=1"]
+        params = ["tune=0", "enable-variance-boost=1", f"lp={svt_level(s)}"]
         mc, fa = (s.get("cll") or [0, 0])[:2]
         if hdr and mc:
             params.append(f"content-light={mc},{fa}")
@@ -276,7 +357,7 @@ def _software_args(codec: str, depth: int, q: int, s: dict, full: bool = True) -
     if codec == "hevc":
         # explicit pools: x265's automatic NUMA pool setup fails inside Docker (set_mempolicy is blocked),
         # which silently disables its thread pool and WPP — ~3x slower on a 24-thread CPU
-        params = ["log-level=error", "repeat-headers=1", "aq-mode=3", f"pools={os.cpu_count() or 4}"]
+        params = ["log-level=error", "repeat-headers=1", "aq-mode=3", f"pools={limits()['cpus']}"]
         if hdr:
             params += ["hdr10=1", "hdr10-opt=1"]
         if dv:   # x265 requires VBV limits when writing Dolby Vision
@@ -840,7 +921,10 @@ class Worker:
         db.x("UPDATE items SET path=?, size=?, codec=?, transcode_hint=?, updated=? WHERE path=?",
              (final, new_size, plan["codec"], "transcoded", time.time(), path))
         db.log("info", "transcode", f"{os.path.basename(final)}: {orig_size >> 20} MB → {new_size >> 20} MB")
-        needs_jellyfin_refresh["flag"] = True
+        from .integrations import jellyfin_changed
+        jellyfin_changed(final, "Modified" if final == path else "Created")
+        if final != path:
+            jellyfin_changed(path, "Deleted")
 
     # ------------------------------------------------------------ resumable chunked encodes
     @staticmethod
@@ -1023,9 +1107,10 @@ class Worker:
     async def _sh(self, jid: int, script: str) -> tuple[bool, str]:
         """Run a shell pipeline in its own process group (so cancel/pause reach every stage)."""
         await self.gate(jid)
-        proc = await asyncio.create_subprocess_shell("set -o pipefail 2>/dev/null; " + script,
+        proc = await asyncio.create_subprocess_exec(*_priority_prefix(), "/bin/bash", "-c",
+                                                    "set -o pipefail 2>/dev/null; " + script,
                                                      stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                                                     start_new_session=True, executable="/bin/bash")
+                                                     start_new_session=True)
         self.procs[jid] = proc
         if self.frozen(jid):
             self._signal(jid, signal.SIGSTOP)
@@ -1087,7 +1172,7 @@ class Worker:
                 raise RuntimeError(f"sample extraction failed: {err[-300:]}")
             samples.append(sp)
         model = "vmaf_4k_v0.6.1" if s.get("height", 0) >= 1800 else "vmaf_v0.6.1"
-        threads = os.cpu_count() or 4
+        threads = limits()["cpus"]
         enc = _software_args(codec, 10, 0, s, full=False)
         tried: dict[int, float] = {}
         ff = shlex.quote(probe.FFMPEG)
@@ -1143,7 +1228,7 @@ class Worker:
     async def _ffmpeg(self, jid: int, cmd: list[str], duration: float, offset: float = 0.0) -> tuple[bool, str]:
         """offset: seconds of the title already encoded (chunked jobs), so progress and ETA cover the whole film."""
         await self.gate(jid)
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+        proc = await asyncio.create_subprocess_exec(*_priority_prefix(), *cmd, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.PIPE, start_new_session=True)
         self.procs[jid] = proc
         if self.frozen(jid):

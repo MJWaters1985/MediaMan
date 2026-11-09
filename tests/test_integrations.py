@@ -148,3 +148,64 @@ def test_old_tmdb_key_is_dropped(tmp_path, monkeypatch):
     assert "tmdb_api_key" not in config.public() and config.get("movies_dir") == "/x"
     assert "secret-value" not in f.read_text()
     monkeypatch.setattr(config, "_settings", None)
+
+
+
+def test_paths_are_translated_for_jellyfin():
+    mine = ["/data/Media/Movies", "/data/Media/Shows", "/pool2/4K"]
+    theirs = ["/Media/Movies", "/Media/Shows", "/config/data/collections", "/data/4K"]
+    m = integrations.map_to_jellyfin
+    assert m("/data/Media/Movies/Dune (2021)/Dune (2021).mkv", mine, theirs) == "/Media/Movies/Dune (2021)/Dune (2021).mkv"
+    assert m("/data/Media/Shows/X/Season 01/X S01E01.mkv", mine, theirs) == "/Media/Shows/X/Season 01/X S01E01.mkv"
+    assert m("/pool2/4K/A/A.mkv", mine, theirs) == "/data/4K/A/A.mkv"
+    assert m("/elsewhere/a.mkv", mine, theirs) is None
+    assert m("/data/Media/Movies/a.mkv", mine, ["/a/Movies", "/b/Movies"]) is None     # ambiguous
+
+
+class FakeJellyfinLibrary(BaseHTTPRequestHandler):
+    posts = []
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, obj, code=200):
+        data = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path.startswith("/Library/VirtualFolders"):
+            return self._json([{"Name": "Movies", "Locations": ["/Media/Movies"]}])
+        self._json({}, 404)
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        FakeJellyfinLibrary.posts.append((self.path, json.loads(body or b"null")))
+        self.send_response(204)
+        self.end_headers()
+
+
+def test_jellyfin_told_only_about_changed_files(tmp_path):
+    srv = HTTPServer(("127.0.0.1", 0), FakeJellyfinLibrary)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    movies = str(tmp_path / "Share" / "Media" / "Movies")
+    config.update({"jellyfin_url": f"http://127.0.0.1:{srv.server_port}", "jellyfin_api_key": "good",
+                   "movies_dir": movies})
+    integrations._folders.update(ts=0)
+    try:
+        integrations.jellyfin_changed(movies + "/Dune (2021)/Dune (2021).mkv", "Modified")
+        integrations.jellyfin_changed(movies + "/Old/Old.mkv", "Deleted")
+        assert integrations.jellyfin_flush() is True and not integrations.jellyfin_pending()
+        path, body = FakeJellyfinLibrary.posts[-1]
+        assert path == "/Library/Media/Updated"
+        assert sorted((u["Path"], u["UpdateType"]) for u in body["Updates"]) == [
+            ("/Media/Movies/Dune (2021)/Dune (2021).mkv", "Modified"), ("/Media/Movies/Old/Old.mkv", "Deleted")]
+        # a file outside Jellyfin's folders: whole-library refresh instead
+        integrations.jellyfin_changed("/nowhere/x.mkv", "Created")
+        integrations.jellyfin_flush()
+        assert FakeJellyfinLibrary.posts[-1][0] == "/Library/Refresh"
+    finally:
+        srv.shutdown()

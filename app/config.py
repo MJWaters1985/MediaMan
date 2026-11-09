@@ -26,7 +26,7 @@ DEFAULTS: dict = {
     "watcher_settle_seconds": 120,  # files must be unchanged this long before import
     "import_mode": "copy",          # copy | hardlink | move  (copy keeps qBittorrent seeding)
     "auto_import_min_confidence": 0.75,
-    "auto_transcode_imports": True,
+    "auto_transcode_imports": False,  # opt-in: rewriting every download automatically is a big step
     "min_video_size_mb": 50,        # smaller videos are treated as samples
     # Optional integrations
     "jellyfin_url": "",
@@ -49,20 +49,25 @@ DEFAULTS: dict = {
     "quality_bias": 0,              # added to the CRF when no VMAF search runs (-4 .. +4)
     "max_height": 0,                # 0 = keep resolution, e.g. 1080 to downscale 4K
     "hdr_policy": "transcode",      # transcode (keep HDR10/HLG metadata) | skip
-    "dv_policy": "convert",         # convert (DV → profile 8.1 HEVC) | skip
+    "dv_policy": "mel_only",        # mel_only (skip profile 7 FEL) | convert (all → profile 8.1) | skip
     "audio_policy": "copy",         # copy | eac3_lossless (convert TrueHD/DTS-HD/FLAC/PCM to EAC3 640k)
     "min_savings_pct": 15,          # discard results that don't save at least this much
     "concurrent_jobs": 1,
     "queue_paused": False,          # Pause queue also freezes the running job; survives restarts
     "resume_queue_on_startup": True,  # False: the queue comes back paused after a restart
     "transcode_window": "",         # e.g. "01:00-07:00"; empty = any time
-    "keep_originals": False,        # move replaced originals to <dir>/.mediaman-trash instead of deleting
-    "device_path": "/dev/dri/renderD128",
-    "settings_version": 2,
+    "keep_originals": True,         # move replaced originals to <dir>/.mediaman-trash instead of deleting
+    "encoder_priority": "low",      # low (nice 10, lowest best-effort I/O) | normal
+    "device_path": "",              # empty: pick the GPU whose encoders work
+    "settings_version": 3,
 }
 
 # keys whose defaults changed in a settings_version bump (older saved values are replaced once)
 MIGRATIONS = {2: ("target_codec", "preferred_backend", "hdr_policy", "quality_bias")}
+# defaults that changed in settings_version 3: an existing install that never saved these keeps the old
+# behaviour instead of silently switching (new installs get the new defaults)
+PRESERVE = {3: {"keep_originals": False, "auto_transcode_imports": True, "dv_policy": "convert",
+                "device_path": "/dev/dri/renderD128"}}
 
 _lock = threading.Lock()
 _settings: dict | None = None
@@ -89,6 +94,13 @@ def load() -> dict:
                     for k in keys:
                         data[k] = DEFAULTS[k]
                     migrated = True
+            if saved:
+                for v, old in sorted(PRESERVE.items()):
+                    if ver < v:
+                        for k, val in old.items():
+                            if k not in saved:
+                                data[k] = val
+                                migrated = True
             data["settings_version"] = DEFAULTS["settings_version"]
             for k in RETIRED_KEYS:
                 if k in data:

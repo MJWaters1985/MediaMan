@@ -35,7 +35,15 @@ def test_codec_per_title():
 def test_assess_rules():
     assert transcode.assess(S())[0]
     assert transcode.assess(S(**UHD))[0]                                   # 88 Mb/s HDR10 remux
-    assert transcode.assess(S(**UHD, dovi=True, dv_profile=7))[0]
+    assert transcode.assess(S(**UHD, dovi=True, dv_profile=7, dv_el="MEL"))[0]
+    ok, why = transcode.assess(S(**UHD, dovi=True, dv_profile=7, dv_el="FEL"))   # default: FEL left alone
+    assert not ok and "full enhancement layer" in why and "FEL" in why
+    assert transcode.assess(S(**UHD, dovi=True, dv_profile=7, dv_el="FEL"), force=True)[0]
+    assert not transcode.assess(S(**UHD, dovi=True, dv_profile=7))[0]      # layer type unknown: left alone
+    assert transcode.assess(S(**UHD, dovi=True, dv_profile=8))[0]
+    config.update({"dv_policy": "convert"})
+    assert transcode.assess(S(**UHD, dovi=True, dv_profile=7, dv_el="FEL"))[0]
+    config.update({"dv_policy": "mel_only"})
     assert not transcode.assess(S(**UHD, dovi=True, dv_profile=5))[0]      # no HDR10 base layer
     assert not transcode.assess(S(vcodec="hevc", bpp=0.08))[0]             # already efficient
     assert not transcode.assess(S(bpp=0.02))[0]
@@ -46,7 +54,7 @@ def test_assess_rules():
     assert not transcode.assess(S(**UHD))[0]
     config.update({"hdr_policy": "transcode", "dv_policy": "skip"})
     assert not transcode.assess(S(**UHD, dovi=True, dv_profile=8))[0]
-    config.update({"dv_policy": "convert"})
+    config.update({"dv_policy": "mel_only"})
 
 
 def test_software_args_keep_hdr():
@@ -108,7 +116,7 @@ def test_settings_migration(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "_settings", None)
     s = config.load()
     assert s["target_codec"] == "auto" and s["preferred_backend"] == "software" and s["hdr_policy"] == "transcode"
-    assert s["movies_dir"] == "/x" and json.loads(f.read_text())["settings_version"] == 2
+    assert s["movies_dir"] == "/x" and json.loads(f.read_text())["settings_version"] == 3
 
 
 def test_hdr_crf_ceiling():
@@ -165,7 +173,7 @@ def test_dolby_vision_becomes_profile_8():
     saved = transcode.TOOLS["dovi_tool"]
     transcode.TOOLS["dovi_tool"] = None
     try:
-        ok, why = transcode.assess(S(**UHD, dovi=True, dv_profile=7))
+        ok, why = transcode.assess(S(**UHD, dovi=True, dv_profile=7, dv_el="MEL"))
         assert not ok and "dovi_tool" in why
     finally:
         transcode.TOOLS["dovi_tool"] = saved
@@ -197,3 +205,72 @@ def test_progressing_encoder_is_left_alone(tmp_path, monkeypatch):
     monkeypatch.setattr(transcode, "STALL_SECONDS", 2)
     ok, err = asyncio.run(transcode.Worker()._ffmpeg(998, [str(fake)], 100))
     assert ok, err
+
+
+def test_new_defaults_dont_change_existing_installs(tmp_path, monkeypatch):
+    """settings_version 3 changed four defaults; an older settings file that never stored them keeps the old ones."""
+    import json
+    f = tmp_path / "settings.json"
+    f.write_text(json.dumps({"settings_version": 2, "movies_dir": "/x", "keep_originals": True}))
+    monkeypatch.setattr(config, "SETTINGS_FILE", str(f))
+    monkeypatch.setattr(config, "_settings", None)
+    s = config.load()
+    assert s["keep_originals"] is True                      # stored: untouched
+    assert s["auto_transcode_imports"] is True and s["dv_policy"] == "convert"   # not stored: old behaviour
+    assert s["device_path"] == "/dev/dri/renderD128"
+    monkeypatch.setattr(config, "SETTINGS_FILE", str(tmp_path / "new.json"))      # a new install
+    monkeypatch.setattr(config, "_settings", None)
+    s = config.load()
+    assert s["keep_originals"] is True and s["auto_transcode_imports"] is False
+    assert s["dv_policy"] == "mel_only" and s["device_path"] == "" and s["encoder_priority"] == "low"
+    monkeypatch.setattr(config, "_settings", None)
+
+
+def test_container_limits_and_av1_level(monkeypatch):
+    lim = {"cpus": 24, "memory": 30 * 1024 ** 3}
+    monkeypatch.setattr(transcode, "limits", lambda: lim)
+    k4 = S(**UHD)
+    assert transcode.svt_level(k4) == 5                     # 24 threads, 15 GB budget: level 5 (~8 GB at 4K)
+    lim.update(cpus=4)
+    assert transcode.svt_level(k4) == 2                     # few CPUs: low level whatever the memory
+    lim.update(cpus=24, memory=8 * 1024 ** 3)
+    assert transcode.svt_level(k4) == 2                     # 4 GB budget at 4K
+    assert transcode.svt_level(S()) >= 4                    # 1080p needs far less
+    config.update({"concurrent_jobs": 2})
+    try:
+        assert transcode.svt_level(k4) == 1                 # two jobs share the budget
+    finally:
+        config.update({"concurrent_jobs": 1})
+    assert "lp=" in " ".join(transcode._software_args("av1", 10, 30, k4))
+
+
+def test_limits_read_the_cgroup(monkeypatch, tmp_path):
+    import builtins
+    files = {"/sys/fs/cgroup/cpu.max": "400000 100000\n", "/sys/fs/cgroup/memory.max": str(6 * 1024 ** 3) + "\n"}
+    real_open = builtins.open
+    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: __import__("io").StringIO(files[p]) if p in files
+                        else real_open(p, *a, **k))
+    lim = transcode.limits()
+    assert lim["cpus"] <= 4 and lim["memory"] == 6 * 1024 ** 3
+
+
+def test_encoders_run_at_low_priority():
+    assert transcode._priority_prefix()[:3] == ["nice", "-n", "10"]
+    config.update({"encoder_priority": "normal"})
+    try:
+        assert transcode._priority_prefix() == []
+    finally:
+        config.update({"encoder_priority": "low"})
+
+
+def test_gpu_is_picked_by_working_encoders(monkeypatch):
+    monkeypatch.setattr(transcode, "_render_nodes", lambda: ["/dev/dri/renderD128", "/dev/dri/renderD129"])
+    works = {("hevc", "/dev/dri/renderD129"), ("h264", "/dev/dri/renderD129"), ("h264", "/dev/dri/renderD128")}
+    monkeypatch.setattr(transcode, "_probe_encoder", lambda b, c, d, dev: (c, dev) in works)
+    config.update({"device_path": ""})
+    assert transcode.pick_device() == "/dev/dri/renderD129"     # the one that can encode HEVC
+    config.update({"device_path": "/dev/dri/renderD128"})
+    try:
+        assert transcode.pick_device() == "/dev/dri/renderD128"  # an explicit choice wins
+    finally:
+        config.update({"device_path": ""})

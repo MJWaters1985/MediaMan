@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth, config, db, fsbrowse, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.6.0"
+VERSION = "1.7.1"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="MediaMan", version=VERSION)
@@ -246,7 +246,6 @@ def apply_item(item_id: int, body: dict = Body(default={})):
             transcode.enqueue(res["path"])
     if body.get("transcode"):
         transcode.enqueue(res["path"])
-    transcode.needs_jellyfin_refresh["flag"] = True
     return res
 
 

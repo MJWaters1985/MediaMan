@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import re
 import subprocess
+import tempfile
 
 from . import db
 
@@ -34,7 +36,7 @@ def ffprobe(path: str, use_cache: bool = True) -> dict | None:
         row = db.one("SELECT size, mtime, data FROM probes WHERE path=?", (path,))
         if row and row["size"] == st.st_size and abs(row["mtime"] - st.st_mtime) < 1:
             cached = db.jload(row["data"])
-            if cached and "_frame_side_data" in cached:
+            if cached and "_frame_side_data" in cached and "_dv_el" in cached:
                 return cached
     try:
         out = subprocess.run(
@@ -55,9 +57,33 @@ def ffprobe(path: str, use_cache: bool = True) -> dict | None:
         data["_frame_side_data"] = sds
     except Exception:
         data["_frame_side_data"] = []
+    data["_dv_el"] = _dv_el(path, data)
     db.x("INSERT OR REPLACE INTO probes(path,size,mtime,data) VALUES(?,?,?,?)",
          (path, st.st_size, st.st_mtime, json.dumps(data)))
     return data
+
+
+def _dv_el(path: str, data: dict) -> str | None:
+    """Profile 7 discs carry an enhancement layer that is either "FEL" (full: real extra picture detail) or
+    "MEL" (minimal: metadata only). The RPU of the first frames tells which (dovi_tool reads MKV directly)."""
+    prof = None
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            prof = next((int(sd["dv_profile"]) for sd in stream.get("side_data_list") or [] if "dv_profile" in sd), None)
+            break
+    if prof != 7 or not shutil.which("dovi_tool"):
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            rpu = os.path.join(td, "rpu.bin")
+            subprocess.run(["dovi_tool", "extract-rpu", "-i", path, "-l", "24", "-o", rpu],
+                           capture_output=True, timeout=120)
+            out = subprocess.run(["dovi_tool", "info", "-i", rpu, "-s"], capture_output=True, text=True,
+                                 timeout=60).stdout
+    except Exception:
+        return None
+    m = re.search(r"Profile:\s*7\s*\((FEL|MEL)\)", out)
+    return m.group(1) if m else None
 
 
 def _num(v, default=None):
@@ -163,6 +189,7 @@ def summarize(data: dict | None) -> dict:
         "hdr": transfer in HDR_TRANSFERS,
         "dovi": dovi or dv_profile is not None,
         "dv_profile": dv_profile,
+        "dv_el": data.get("_dv_el"),
         "hdr10plus": hdr10plus,
         "mastering": mastering,
         "cll": list(cll),

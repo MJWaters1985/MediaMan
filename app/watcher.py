@@ -64,7 +64,8 @@ def process_entry(name: str, signature: str) -> None:
     if not vids:
         db.x("UPDATE imports SET status='empty', message='no video files', updated=? WHERE id=?", (now, imp_id))
         return
-    thr = float(config.get("auto_import_min_confidence") or 0.75)
+    thr = config.get("auto_import_min_confidence")
+    thr = 0.75 if thr is None else float(thr)      # above 1 (the "never" choice): every download waits for review
     imported, review, failed = 0, 0, 0
     for v in vids:
         existing = db.one("SELECT * FROM items WHERE path=?", (v,))
@@ -94,8 +95,6 @@ def process_entry(name: str, signature: str) -> None:
     msg = f"{imported} imported" + (f", {review} need review" if review else "") + (f", {failed} failed" if failed else "")
     db.x("UPDATE imports SET status=?, message=?, updated=? WHERE id=?", (status, msg, time.time(), imp_id))
     db.log("info", "import", f"{name}: {msg}")
-    if imported:
-        transcode.needs_jellyfin_refresh["flag"] = True
 
 
 def poll() -> None:
@@ -156,9 +155,8 @@ async def loop():
                 state["error"] = str(e)
                 db.log("error", "watcher", str(e))
             state["last_poll"] = time.time()
-        # batch Jellyfin refreshes: at most one a minute
-        if transcode.needs_jellyfin_refresh["flag"] and time.time() - last_refresh > 60:
-            transcode.needs_jellyfin_refresh["flag"] = False
+        # batch Jellyfin updates: at most one call a minute, listing the files that changed
+        if integrations.jellyfin_pending() and time.time() - last_refresh > 60:
             last_refresh = time.time()
-            await asyncio.to_thread(integrations.jellyfin_refresh)
+            await asyncio.to_thread(integrations.jellyfin_flush)
         await asyncio.sleep(max(10, int(config.get("watcher_interval") or 60)))

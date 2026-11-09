@@ -288,6 +288,9 @@ def apply_item(item_id: int) -> dict:
             db.x("UPDATE items SET status='applied', message=?, updated=? WHERE id=?",
                  (f"{how} to library", time.time(), item_id))
         db.log("info", "organize", f"{how}: {src} -> {dst}")
+        integrations.jellyfin_changed(dst, "Created")
+        if item["source"] == "scan":
+            integrations.jellyfin_changed(src, "Deleted")
         return {"result": how, "path": dst}
 
 
