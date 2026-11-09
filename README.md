@@ -1,3 +1,5 @@
+<img src="app/static/icon.svg" alt="" width="96" align="right">
+
 # MediaMan
 
 A self-hosted media manager for a TrueNAS box running **Jellyfin** and **qBittorrent**. It sees the

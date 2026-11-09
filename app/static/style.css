@@ -15,8 +15,7 @@ body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI",
 header { display: flex; align-items: center; gap: 24px; padding: 10px 20px; background: var(--panel);
   border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
 .brand { font-weight: 700; font-size: 16px; display: flex; align-items: center; gap: 8px; }
-.logo { background: var(--accent); color: #fff; width: 26px; height: 26px; border-radius: 7px; display: grid;
-  place-items: center; font-size: 14px; }
+.logo { width: 28px; height: 28px; display: block; }
 nav { display: flex; gap: 2px; flex-wrap: wrap; }
 nav button { background: none; border: 0; padding: 8px 12px; border-radius: 8px; color: var(--muted); font: inherit;
   cursor: pointer; }

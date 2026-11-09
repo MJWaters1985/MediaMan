@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>MediaMan</title>
+  <path d="M218.2 61.6 L232.0 17.2 L280.0 17.2 L293.8 61.6 L339.7 76.6 L376.9 48.7 L415.8 76.9 L400.8 121.0 L429.2 160.0 L475.7 159.4 L490.5 205.1 L452.5 231.9 L452.5 280.1 L490.5 306.9 L475.7 352.6 L429.2 352.0 L400.8 391.0 L415.8 435.1 L376.9 463.3 L339.7 435.4 L293.8 450.4 L280.0 494.8 L232.0 494.8 L218.2 450.4 L172.3 435.4 L135.1 463.3 L96.2 435.1 L111.2 391.0 L82.8 352.0 L36.3 352.6 L21.5 306.9 L59.5 280.1 L59.5 231.9 L21.5 205.1 L36.3 159.4 L82.8 160.0 L111.2 121.0 L96.2 76.9 L135.1 48.7 L172.3 76.6 Z" fill="#4f7cff" stroke="#4f7cff" stroke-width="8" stroke-linejoin="round"/>
+  <circle cx="256" cy="256" r="166" fill="none" stroke="#f5c542" stroke-width="13"/>
+  <path d="M166 340 L166 172 L212 172 L256 240 L300 172 L346 172 L346 340 L304 340 L304 246 L268 300 L244 300 L208 246 L208 340 Z" transform="translate(256 256) skewX(-12) translate(-256 -256)" fill="#ffffff" stroke="#f5c542" stroke-width="14" stroke-linejoin="round" paint-order="stroke"/>
+</svg>
