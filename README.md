@@ -155,6 +155,14 @@ docker run --rm -v "$PWD":/src -w /src mediaman:dev sh -c "pip install -q pytest
 ./run-test.sh          # runs the app against ./testdata on http://localhost:8765
 ```
 
+The end-to-end check of chunked encodes (interrupt and resume, exact frame count, no shifted frames at
+the joins, HDR10, Dolby Vision 8, audio, subtitles, chapters, and Pause queue freezing a job) uses real
+encoders and takes a few minutes:
+
+```bash
+docker run --rm -v "$PWD":/src:ro --entrypoint python mediaman:dev /src/tests/integration_chunked.py
+```
+
 The code lives in `app/`: `identify.py` (hints), `naming.py` (Jellyfin paths and sidecars),
 `organizer.py` (scan, propose, apply), `watcher.py` (downloads), `transcode.py` (hardware
 detection, planning, queue), `integrations.py` (TMDb, Jellyfin, qBittorrent), `main.py` (API), and
