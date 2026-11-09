@@ -69,6 +69,7 @@ language and default/forced flags. MP4 `mov_text` becomes SRT; broadcast caption
 **Before the original is replaced**, the result must have:
 
 - a video stream, with a duration within 1% of the source
+- for chunked encodes, exactly the source's frame count
 - the same audio tracks and channel counts, and the same number of subtitle tracks
 - the same HDR transfer, plus the mastering display, Dolby Vision and HDR10+ metadata where the source had them
 - a size at least `min savings` smaller
@@ -82,8 +83,20 @@ are never transcoded.
 its thread pool and wavefront parallelism. MediaMan passes `pools=<cpu count>` explicitly, which is
 about 3.4× faster on a 24-thread Ryzen.
 
-The queue can be paused and resumed, single jobs paused or cancelled, a job moved to the top, and a
-time window set (e.g. `01:00-07:00`). Jobs interrupted by a restart go back into the queue.
+**Resumable encodes:** CPU encodes of constant-frame-rate video (nearly every remux) are written in
+2-minute chunks to a hidden `.<name>.mediaman-work` folder next to the file. If MediaMan restarts
+(a redeploy, NAS reboot or app update), the job goes back into the queue and resumes after the last
+finished chunk; the quality search isn't repeated. When the last chunk is done, the chunks are
+joined, HDR10+ metadata is injected if the source had it, and mkvmerge adds the source's audio,
+subtitles, chapters and fonts back (it also writes the Dolby Vision configuration). mkvmerge stores
+three-letter languages in their bibliographic form (`fre`, `ger`), which Jellyfin treats the same.
+GPU encodes, variable-frame-rate video and AV1 Dolby Vision still run as a single encode.
+
+**Pausing:** *Pause queue* freezes the running job on the spot (its encoder uses no CPU) and starts
+nothing new; *Resume queue* continues it from the same frame. The pause is saved, so it survives a
+restart. A job can also be paused on its own. Outside the *Only run between* window (e.g.
+`01:00-07:00`) the running job is frozen the same way and continues when the window opens.
+Cancelling a job deletes its work folder.
 
 ## Install on TrueNAS (Community Edition 25.04+)
 

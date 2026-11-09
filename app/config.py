@@ -50,6 +50,7 @@ DEFAULTS: dict = {
     "audio_policy": "copy",         # copy | eac3_lossless (convert TrueHD/DTS-HD/FLAC/PCM to EAC3 640k)
     "min_savings_pct": 15,          # discard results that don't save at least this much
     "concurrent_jobs": 1,
+    "queue_paused": False,          # Pause queue also freezes the running job; survives restarts
     "transcode_window": "",         # e.g. "01:00-07:00"; empty = any time
     "keep_originals": False,        # move replaced originals to <dir>/.mediaman-trash instead of deleting
     "device_path": "/dev/dri/renderD128",

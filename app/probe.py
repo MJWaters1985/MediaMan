@@ -76,6 +76,27 @@ def main_video(data: dict) -> dict | None:
     return vids[0] if vids else None
 
 
+def _frame_count(v: dict) -> int | None:
+    n = v.get("nb_frames")
+    if n and str(n).isdigit():
+        return int(n)
+    for k, val in (v.get("tags") or {}).items():
+        if k.upper().startswith("NUMBER_OF_FRAMES") and str(val).isdigit():
+            return int(val)
+    return None
+
+
+def _vtag_duration(v: dict) -> float:
+    for k, val in (v.get("tags") or {}).items():
+        if k.upper().startswith("DURATION"):
+            try:
+                h, m, sec = str(val).split(":")
+                return int(h) * 3600 + int(m) * 60 + float(sec)
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
 def summarize(data: dict | None) -> dict:
     """Reduce ffprobe JSON to the facts the planner and UI need."""
     if not data:
@@ -126,6 +147,12 @@ def summarize(data: dict | None) -> dict:
         "profile": v.get("profile", ""),
         "width": w, "height": h, "fps": round(fps, 3),
         "fps_rational": v.get("r_frame_rate") if (v.get("r_frame_rate") or "0/0") != "0/0" else None,
+        # constant frame rate (needed for resumable chunked encodes) and exact frame count when the file has one
+        "cfr": (_num(v.get("r_frame_rate")) or 0) > 0
+               and abs((_num(v.get("r_frame_rate")) or 0) - (_num(v.get("avg_frame_rate")) or _num(v.get("r_frame_rate")) or 0)) < 0.01,
+        "frames": _frame_count(v),
+        "vduration": _num(v.get("duration")) or _vtag_duration(v) or duration,
+        "vstart": max(0.0, (_num(v.get("start_time")) or 0.0) - (_num(fmt.get("start_time")) or 0.0)),
         "pix_fmt": pix, "bit_depth": depth,
         "vbitrate": int(vbit or 0),
         "bpp": (vbit / (w * h * fps)) if (vbit and w and h) else 0,

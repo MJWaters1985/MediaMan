@@ -134,3 +134,24 @@ def test_skipped_files_are_remembered(tmp_path):
     assert transcode.skipped_before(str(f)) is None
     assert transcode.enqueue(str(f))
     db.x("DELETE FROM jobs")
+
+
+def test_chunked_plan_rules():
+    transcode.TOOLS["mkvmerge"] = "/usr/bin/mkvmerge"
+    base = S(**UHD, cfr=True, vduration=7200, fps=23.976, fps_rational="24000/1001")
+    assert transcode.chunkable(base, "software", "av1")
+    assert transcode.chunkable(dict(base, dovi=True), "software", "hevc")
+    assert not transcode.chunkable(dict(base, dovi=True), "software", "av1")   # AV1 DV stays one encode
+    assert not transcode.chunkable(dict(base, cfr=False), "software", "av1")   # VFR
+    assert not transcode.chunkable(base, "vaapi", "hevc")                      # GPU
+    cmd = transcode.chunk_command("/in.mkv", "/w/c1.obu", base, "av1", 24, 2877, 2877)
+    j = " ".join(cmd)
+    assert "-ss 119.974021" in j and "-frames:v 2877" in j and "-f obu" in j and "-an" in j
+    assert "-ss" not in " ".join(transcode.chunk_command("/in.mkv", "/w/c0.obu", base, "av1", 24, 0, 2877))
+
+
+def test_queue_pause_is_saved():
+    transcode.worker.paused = True
+    assert config.get("queue_paused") is True
+    transcode.worker.paused = False
+    assert config.get("queue_paused") is False

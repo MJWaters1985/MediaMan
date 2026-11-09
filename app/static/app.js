@@ -266,7 +266,7 @@ async function loadQueue() {
   const jobs = await api("/api/jobs");
   const q = STATUS.queue || {};
   $("#q-toggle").textContent = q.paused ? "▶ Resume queue" : "⏸ Pause queue";
-  $("#q-state").textContent = q.paused ? "Queue paused — running jobs finish" : !q.in_window ? `Outside transcode window (${SETTINGS.transcode_window})` : "";
+  $("#q-state").textContent = q.paused ? "Queue paused — the running job is frozen and continues when you resume" : !q.in_window ? `Outside transcode window (${SETTINGS.transcode_window}) — the running job is frozen until it opens` : "";
   if (!jobs.length) { setHTML($("#queue-list"), `<div class="empty">Queue is empty. Queue files from the Library tab or let imports add them.</div>`); return; }
   setHTML($("#queue-list"), jobs.map((j) => {
     const name = j.path.split("/").pop(), dir = j.path.split("/").slice(-3, -1).join("/");
@@ -321,7 +321,7 @@ const FIELDS = [
     ["audio_policy", "Audio", "select:copy|eac3_lossless", "eac3_lossless converts TrueHD/DTS-HD/FLAC/PCM to EAC3 640k."],
     ["min_savings_pct", "Min savings (%)", "number", "Results that save less are discarded and the original kept."],
     ["concurrent_jobs", "Parallel jobs", "number", ""],
-    ["transcode_window", "Only run between", "text", "e.g. 01:00-07:00. Empty = any time."],
+    ["transcode_window", "Only run between", "text", "e.g. 01:00-07:00. Empty = any time. Outside the window a running job is frozen mid-film and continues when it reopens."],
     ["keep_originals", "Keep originals", "bool", "Move replaced files into .mediaman-trash in the library instead of deleting them."],
     ["device_path", "GPU render node", "text", ""],
   ]],

@@ -404,6 +404,58 @@ def build_command(src: str, dst: str, s: dict, backend: str, codec: str, mode: s
     return cmd
 
 
+CHUNK_SECONDS = 120         # content per chunk; a restart loses at most one chunk of work
+RAW_FORMAT = {"hevc": ("hevc", ".hevc"), "av1": ("obu", ".obu")}
+
+
+def chunkable(s: dict, backend: str, codec: str) -> bool:
+    """Software HEVC/AV1 encodes of constant-frame-rate video are written as resumable chunks.
+    (AV1 Dolby Vision stays a single encode: its RPUs aren't carried through a raw AV1 stream.)"""
+    return (backend == "software" and codec in RAW_FORMAT and bool(s.get("cfr")) and bool(TOOLS["mkvmerge"])
+            and not (codec == "av1" and s.get("dovi")) and (s.get("vduration") or s.get("duration") or 0) > 0)
+
+
+def exact_fps(s: dict) -> float:
+    """The rational frame rate (24000/1001, not the rounded 23.976): chunk seeks must stay exact over 3 hours."""
+    try:
+        a, b = (s.get("fps_rational") or "").split("/")
+        if float(b) and 1 < float(a) / float(b) < 240:
+            return float(a) / float(b)
+    except ValueError:
+        pass
+    return s.get("fps") or 24.0
+
+
+def chunk_frames(s: dict) -> int:
+    return max(1, round(CHUNK_SECONDS * exact_fps(s)))
+
+
+def chunk_command(src: str, out: str, s: dict, codec: str, crf: int, start_frame: int, nframes: int) -> list[str]:
+    """Encode source frames [start_frame, start_frame + nframes) to a raw video stream.
+    The input seek lands half a frame before the first wanted frame: ffmpeg decodes from the previous
+    keyframe and drops everything earlier, so consecutive chunks neither overlap nor leave gaps."""
+    ss = (s.get("vstart") or 0) + (start_frame - 0.5) / exact_fps(s) if start_frame else 0
+    size = _scaled(s, int(config.get("max_height") or 0))
+    cmd = [probe.FFMPEG, "-hide_banner", "-nostdin", "-y", "-v", "error", "-progress", "pipe:1", "-nostats"]
+    if ss > 0:
+        cmd += ["-ss", f"{ss:.6f}"]
+    cmd += ["-i", src, "-map", "0:V:0", "-an", "-sn", "-dn"]
+    if size:
+        cmd += ["-vf", f"scale={size[0]}:{size[1]}:flags=lanczos"]
+    cmd += _software_args(codec, 10, crf, s) + _color_args(s)
+    cmd += ["-frames:v", str(nframes), "-fps_mode", "passthrough", "-f", RAW_FORMAT[codec][0], out]
+    return cmd
+
+
+def streams_command(src: str, out: str, s: dict, stamp: str) -> list[str]:
+    """Everything except the video (audio, subtitles, attachments, chapters, tags) into a side file."""
+    a = _stream_args(s)
+    i = a.index("0:V:0")
+    a = a[:i - 1] + a[i + 3:]          # drop "-map 0:V:0 -disposition:v:0 default"
+    return [probe.FFMPEG, "-hide_banner", "-nostdin", "-y", "-v", "error", "-i", src, *a,
+            "-metadata", f"MEDIAMAN_TRANSCODED={stamp}", "-f", "matroska", out]
+
+
 def hdr10plus_supported() -> bool:
     """HDR10+ is extracted from the source and injected into the finished HEVC stream, then remuxed with
     mkvmerge (which also writes the Dolby Vision config record when the stream carries DV)."""
@@ -456,6 +508,10 @@ def make_plan(path: str, s: dict, force: bool = False, crf: int | None = None) -
     expect = {"hdr": bool(s.get("hdr")), "transfer": s.get("color_transfer"),
               "mastering": bool(s.get("mastering")), "dovi": bool(s.get("dovi")),
               "hdr10plus": bool(s.get("hdr10plus"))}
+    plan.update(chunked=chunkable(s, backend, codec))
+    if plan["chunked"]:
+        plan["note"] = ((plan.get("note") + "; ") if plan.get("note") else "") + \
+            f"encoded in {CHUNK_SECONDS // 60 or 1}-minute chunks, so a restart resumes where it stopped"
     plan.update(backend=backend, codec=codec, crf=crf if backend == "software" else None, tmp=tmp,
                 workdir=base + ".mediaman-work", attempts=attempts, expect=expect,
                 search=backend == "software" and vmaf_enabled() and codec in ("av1", "hevc"),
@@ -543,8 +599,38 @@ class Worker:
     def __init__(self):
         self.procs: dict[int, asyncio.subprocess.Process] = {}
         self.cancelled: set[int] = set()
-        self.paused = False
         self.tasks: dict[int, asyncio.Task] = {}
+        self.manual: set[int] = set()     # jobs paused with their own Pause button
+        self.held: set[int] = set()       # jobs frozen because the queue is paused / outside the time window
+        self.last: dict[int, dict] = {}   # last ffmpeg progress block per job
+
+    @property
+    def paused(self) -> bool:
+        return bool(config.get("queue_paused"))
+
+    @paused.setter
+    def paused(self, v: bool):
+        config.update({"queue_paused": bool(v)})
+
+    def _signal(self, jid: int, sig) -> None:
+        p = self.procs.get(jid)
+        if p and p.returncode is None:
+            try:
+                os.killpg(p.pid, sig)
+            except ProcessLookupError:
+                pass
+
+    def frozen(self, jid: int) -> bool:
+        return jid in self.manual or jid in self.held
+
+    def _set_status(self, jid: int):
+        db.x("UPDATE jobs SET status=? WHERE id=? AND status IN ('running','paused')",
+             ("paused" if self.frozen(jid) else "running", jid))
+
+    async def gate(self, jid: int):
+        """Called before each new encoder process: a frozen job waits here instead of starting it."""
+        while self.frozen(jid) and jid not in self.cancelled:
+            await asyncio.sleep(1)
 
     async def loop(self):
         while True:
@@ -558,7 +644,18 @@ class Worker:
         for jid, t in list(self.tasks.items()):
             if t.done():
                 self.tasks.pop(jid, None)
-        if self.paused or not in_window():
+        hold = self.paused or not in_window()
+        for jid in list(self.tasks):
+            if hold and jid not in self.held:
+                self.held.add(jid)
+                self._signal(jid, signal.SIGSTOP)
+                self._set_status(jid)
+            elif not hold and jid in self.held:
+                self.held.discard(jid)
+                if not self.frozen(jid):
+                    self._signal(jid, signal.SIGCONT)
+                self._set_status(jid)
+        if hold:
             return
         slots = max(1, int(config.get("concurrent_jobs") or 1)) - len(self.tasks)
         if slots <= 0:
@@ -581,11 +678,16 @@ class Worker:
              (time.time(), jid))
 
     def pause_job(self, jid: int, pause: bool):
-        p = self.procs.get(jid)
-        if not p or p.returncode is not None:
+        if jid not in self.tasks:
             return False
-        os.killpg(p.pid, signal.SIGSTOP if pause else signal.SIGCONT)
-        db.x("UPDATE jobs SET status=? WHERE id=?", ("paused" if pause else "running", jid))
+        if pause:
+            self.manual.add(jid)
+            self._signal(jid, signal.SIGSTOP)
+        else:
+            self.manual.discard(jid)
+            if not self.frozen(jid):
+                self._signal(jid, signal.SIGCONT)
+        self._set_status(jid)
         return True
 
     async def run(self, job: dict):
@@ -598,6 +700,9 @@ class Worker:
             db.log("error", "transcode", f"{path}: {e}")
         finally:
             self.procs.pop(jid, None)
+            self.manual.discard(jid)
+            self.held.discard(jid)
+            self.last.pop(jid, None)
 
     async def _run(self, jid: int, path: str, force: bool):
         if not os.path.exists(path):
@@ -615,20 +720,33 @@ class Worker:
             return
         workdir = plan["workdir"]
         os.makedirs(workdir, exist_ok=True)
+        keep = False
         try:
             await self._encode_and_replace(jid, path, s, plan, force, orig_size)
+        except asyncio.CancelledError:
+            # MediaMan is shutting down (restart, redeploy): keep finished chunks so the job resumes
+            keep = bool(plan.get("chunked")) and jid not in self.cancelled
+            raise
         finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+            if not keep:
+                shutil.rmtree(workdir, ignore_errors=True)
 
     async def _encode_and_replace(self, jid: int, path: str, s: dict, plan: dict, force: bool, orig_size: int):
-        if plan.get("hdr10plus_json"):
+        state = self._load_state(path, s, plan) if plan.get("chunked") else {}
+        js = plan.get("hdr10plus_json")
+        if js and not os.path.exists(js):
             db.x("UPDATE jobs SET message=? WHERE id=?", ("extracting HDR10+ metadata", jid))
             ok, err = await self._sh(jid, f"{shlex.quote(probe.FFMPEG)} -nostdin -v error -i {shlex.quote(path)} "
                                           f"-map 0:V:0 -c:v copy -bsf:v hevc_mp4toannexb -f hevc - | "
-                                          f"hdr10plus_tool extract -o {shlex.quote(plan['hdr10plus_json'])} -")
-            if not ok or not os.path.getsize(plan["hdr10plus_json"]):
+                                          f"hdr10plus_tool extract -o {shlex.quote(js + '.part')} -")
+            if not ok or not os.path.exists(js + ".part") or not os.path.getsize(js + ".part"):
                 raise RuntimeError(f"HDR10+ metadata extraction failed: {err[-400:]}")
-        if plan.get("search"):
+            os.replace(js + ".part", js)
+        if state.get("vmaf"):
+            plan = await asyncio.to_thread(make_plan, path, s, force, state["vmaf"]["crf"])
+            plan["vmaf"] = state["vmaf"]
+            db.x("UPDATE jobs SET plan=? WHERE id=?", (db.jdump(plan | {"force": force}), jid))
+        elif plan.get("search"):
             crf, score, tried = await self._crf_search(jid, path, s, plan)
             if jid in self.cancelled:
                 return
@@ -636,6 +754,10 @@ class Worker:
             plan["vmaf"] = {"crf": crf, "score": score, "tried": tried, "target": float(config.get("vmaf_target"))}
             db.x("UPDATE jobs SET plan=? WHERE id=?", (db.jdump(plan | {"force": force}), jid))
         tmp = plan["tmp"]
+        if plan.get("chunked"):
+            if not await self._encode_chunked(jid, path, s, plan, state):
+                return
+            return await self._verify_and_replace(jid, path, s, plan, force, orig_size)
         errors = []
         for att in plan["attempts"]:
             if jid in self.cancelled:
@@ -658,7 +780,10 @@ class Worker:
             await self._inject_hdr10plus(jid, plan, s)
             if jid in self.cancelled:
                 return
-        # ---- verify the result before touching the original
+        await self._verify_and_replace(jid, path, s, plan, force, orig_size)
+
+    async def _verify_and_replace(self, jid: int, path: str, s: dict, plan: dict, force: bool, orig_size: int):
+        tmp = plan["tmp"]
         out = probe.summarize(await asyncio.to_thread(probe.ffprobe, tmp, False))
         new_size = os.path.getsize(tmp)
         dur_in, dur_out = s.get("duration") or 0, out.get("duration") or 0
@@ -667,6 +792,8 @@ class Worker:
             problem = "output has no video stream"
         elif dur_in and abs(dur_in - dur_out) > max(2.0, dur_in * 0.01):
             problem = f"duration mismatch ({dur_in:.0f}s vs {dur_out:.0f}s)"
+        elif plan.get("chunked") and plan.get("frame_problem"):
+            problem = plan["frame_problem"]
         elif len(out.get("audio", [])) != len(s.get("audio", [])):
             problem = "audio track count changed"
         elif [a.get("channels") for a in out.get("audio", [])] != [a.get("channels") for a in s.get("audio", [])] \
@@ -700,6 +827,128 @@ class Worker:
         db.log("info", "transcode", f"{os.path.basename(final)}: {orig_size >> 20} MB → {new_size >> 20} MB")
         needs_jellyfin_refresh["flag"] = True
 
+    # ------------------------------------------------------------ resumable chunked encodes
+    @staticmethod
+    def _settings_sig(s: dict, codec: str) -> str:
+        return " ".join(_software_args(codec, 10, 0, s)) + f" h{config.get('max_height')} v{config.get('vmaf_target')}"
+
+    def _load_state(self, path: str, s: dict, plan: dict) -> dict:
+        """Work left by an interrupted run of this job, or {} (and a clean work folder) when it doesn't match."""
+        wd = plan["workdir"]
+        f = os.path.join(wd, "state.json")
+        st = os.stat(path)
+        want = {"v": 1, "src": [st.st_size, int(st.st_mtime)], "codec": plan["codec"],
+                "chunk": chunk_frames(s), "sig": self._settings_sig(s, plan["codec"])}
+        try:
+            with open(f) as fh:
+                state = json.load(fh)
+            if all(state.get(k) == v for k, v in want.items()):
+                return state
+        except (OSError, ValueError):
+            pass
+        shutil.rmtree(wd, ignore_errors=True)
+        os.makedirs(wd, exist_ok=True)
+        return dict(want)
+
+    @staticmethod
+    def _save_state(wd: str, state: dict):
+        f = os.path.join(wd, "state.json")
+        with open(f + ".part", "w") as fh:
+            json.dump(state, fh)
+        os.replace(f + ".part", f)
+
+    async def _encode_chunked(self, jid: int, path: str, s: dict, plan: dict, state: dict) -> bool:
+        wd, codec, crf = plan["workdir"], plan["codec"], plan["crf"]
+        fps, n_per = exact_fps(s), chunk_frames(s)
+        ext = RAW_FORMAT[codec][1]
+        name = os.path.basename(path)
+        expected = s.get("frames") or round((s.get("vduration") or s.get("duration") or 0) * fps)
+        dur = expected / fps
+        total_chunks = max(1, -(-expected // n_per))
+        state.update(crf=crf, vmaf=plan.get("vmaf"))
+        state.setdefault("chunks", [])
+        self._save_state(wd, state)
+        video = os.path.join(wd, "video" + ext)
+        q = shlex.quote
+        if not state.get("joined"):
+            chunks = state["chunks"]
+            done = sum(chunks)
+            if chunks:
+                db.log("info", "transcode", f"{name}: resuming at chunk {len(chunks) + 1} of ~{total_chunks} "
+                                            f"({done / fps / 60:.0f} min already encoded)")
+            while True:
+                if jid in self.cancelled:
+                    return False
+                k = len(chunks)
+                out = os.path.join(wd, f"c{k:05d}{ext}")
+                db.x("UPDATE jobs SET message=? WHERE id=?",
+                     (f"{plan['reason']} via cpu ({ENCODERS['software'][codec]}) — chunk {k + 1} of {total_chunks}", jid))
+                self.last.pop(jid, None)
+                ok, err = await self._ffmpeg(jid, chunk_command(path, out + ".part", s, codec, crf, done, n_per),
+                                             dur, offset=done / fps)
+                if jid in self.cancelled:
+                    return False
+                got = int(float((self.last.get(jid) or {}).get("frame") or 0))
+                empty = not os.path.exists(out + ".part") or not os.path.getsize(out + ".part") or not got
+                if not ok and not (empty and done >= expected - 2):
+                    raise RuntimeError(f"chunk {k + 1} failed: {err[-400:]}")
+                if empty:
+                    if os.path.exists(out + ".part"):
+                        os.unlink(out + ".part")
+                    break
+                os.replace(out + ".part", out)
+                chunks.append(got)
+                done += got
+                self._save_state(wd, state)
+                if got < n_per:
+                    break
+            if not chunks:
+                raise RuntimeError("the encoder produced no video")
+            db.x("UPDATE jobs SET message=? WHERE id=?", ("joining chunks", jid))
+            files = " ".join(q(os.path.join(wd, f"c{i:05d}{ext}")) for i in range(len(chunks)))
+            ok, err = await self._sh(jid, f"cat {files} > {q(video + '.part')} && mv -f {q(video + '.part')} {q(video)}")
+            if not ok:
+                return False if jid in self.cancelled else self._fail(f"joining chunks failed: {err[-300:]}")
+            state["joined"] = True
+            self._save_state(wd, state)
+            for i in range(len(chunks)):
+                try:
+                    os.unlink(os.path.join(wd, f"c{i:05d}{ext}"))
+                except OSError:
+                    pass
+        frames = sum(state["chunks"])
+        if s.get("frames") and frames != s["frames"]:
+            plan["frame_problem"] = f"frame count changed ({s['frames']} → {frames})"
+        elif not s.get("frames") and abs(frames - expected) > 2:
+            plan["frame_problem"] = f"frame count changed (~{expected} → {frames})"
+        js = plan.get("hdr10plus_json")
+        if js and not state.get("injected"):
+            db.x("UPDATE jobs SET message=? WHERE id=?", ("injecting HDR10+ metadata", jid))
+            ok, err = await self._sh(jid, f"hdr10plus_tool inject -i {q(video)} -j {q(js)} -o {q(video + '.inj')} && "
+                                          f"mv -f {q(video + '.inj')} {q(video)}")
+            if not ok:
+                return False if jid in self.cancelled else self._fail(f"HDR10+ injection failed: {err[-400:]}")
+            state["injected"] = True
+            self._save_state(wd, state)
+        db.x("UPDATE jobs SET message=? WHERE id=?", ("adding audio, subtitles and chapters", jid))
+        side = os.path.join(wd, "streams.mkv")
+        stamp = f"{codec}/software/q{crf} {dt.date.today().isoformat()}"
+        ok, err = await self._sh(jid, " ".join(q(a) for a in streams_command(path, side, s, stamp)))
+        if not ok:
+            return False if jid in self.cancelled else self._fail(f"copying audio/subtitles failed: {err[-400:]}")
+        fr = s.get("fps_rational") or f"{fps}"
+        ok, err = await self._sh(jid, f"mkvmerge -q -o {q(plan['tmp'])} --default-duration 0:{fr}fps {q(video)} "
+                                      f"{q(side)}; rc=$?; [ $rc -le 1 ]")
+        if not ok:
+            if os.path.exists(plan["tmp"]):
+                os.unlink(plan["tmp"])
+            return False if jid in self.cancelled else self._fail(f"final mux failed: {err[-400:]}")
+        return True
+
+    @staticmethod
+    def _fail(msg: str):
+        raise RuntimeError(msg)
+
     def _replace(self, path: str, tmp: str, final: str) -> str:
         if os.path.normpath(final) != os.path.normpath(path) and os.path.exists(final):
             final = os.path.splitext(path)[0] + " (mediaman).mkv"
@@ -719,10 +968,13 @@ class Worker:
 
     async def _sh(self, jid: int, script: str) -> tuple[bool, str]:
         """Run a shell pipeline in its own process group (so cancel/pause reach every stage)."""
+        await self.gate(jid)
         proc = await asyncio.create_subprocess_shell("set -o pipefail 2>/dev/null; " + script,
                                                      stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                                                      start_new_session=True, executable="/bin/bash")
         self.procs[jid] = proc
+        if self.frozen(jid):
+            self._signal(jid, signal.SIGSTOP)
         try:
             out, err = await proc.communicate()
         except BaseException:
@@ -825,10 +1077,14 @@ class Worker:
             best = crf_range(codec, s)[0]
         return best, tried.get(best, 0.0), {str(k): v for k, v in sorted(tried.items())}
 
-    async def _ffmpeg(self, jid: int, cmd: list[str], duration: float) -> tuple[bool, str]:
+    async def _ffmpeg(self, jid: int, cmd: list[str], duration: float, offset: float = 0.0) -> tuple[bool, str]:
+        """offset: seconds of the title already encoded (chunked jobs), so progress and ETA cover the whole film."""
+        await self.gate(jid)
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.PIPE, start_new_session=True)
         self.procs[jid] = proc
+        if self.frozen(jid):
+            self._signal(jid, signal.SIGSTOP)
         err_buf: list[bytes] = []
 
         async def drain():
@@ -851,9 +1107,11 @@ class Worker:
                     continue
                 k, v = line.split("=", 1)
                 cur[k] = v
+                if k == "progress":
+                    self.last[jid] = dict(cur)
                 if k == "progress" and time.time() - last > 2:
                     last = time.time()
-                    t = num(cur.get("out_time_us") or cur.get("out_time_ms")) / 1e6
+                    t = offset + num(cur.get("out_time_us") or cur.get("out_time_ms")) / 1e6
                     prog = min(0.999, t / duration) if duration else 0
                     speed = cur.get("speed", "").strip()
                     sp = num(speed.rstrip("x"))
