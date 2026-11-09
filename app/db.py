@@ -65,9 +65,13 @@ def conn() -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.executescript(SCHEMA)
-        # jobs interrupted by a restart go back to the queue
-        _conn.execute("UPDATE jobs SET status='queued', progress=0 WHERE status IN ('running','paused')")
     return _conn
+
+
+def requeue_interrupted():
+    """Jobs left running/paused by a previous process go back to the queue. Only the server calls this at
+    startup: any other process opening the database (a CLI check, a test) must not touch live jobs."""
+    x("UPDATE jobs SET status='queued', progress=0 WHERE status IN ('running','paused')")
 
 
 def q(sql: str, args=()) -> list[dict]:

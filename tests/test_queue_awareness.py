@@ -44,3 +44,13 @@ def test_work_files_not_scanned(tmp_path):
     for f in ("Film (2000).mkv", ".Film (2000).mediaman.mkv", ".Film (2000).mediaman-work/ref0.mkv"):
         (d / f).write_bytes(b"x")
     assert [os.path.basename(p) for p in organizer.walk_videos(str(tmp_path / "lib"))] == ["Film (2000).mkv"]
+
+
+def test_opening_db_does_not_requeue_running_jobs():
+    jid = db.x("INSERT INTO jobs(path,status) VALUES(?,?)", ("/x.mkv", "running"))
+    db._conn = None                     # a second process opening the database
+    db.conn()
+    assert db.one("SELECT status FROM jobs WHERE id=?", (jid,))["status"] == "running"
+    db.requeue_interrupted()            # what the server does at startup
+    assert db.one("SELECT status FROM jobs WHERE id=?", (jid,))["status"] == "queued"
+    db.x("DELETE FROM jobs WHERE id=?", (jid,))

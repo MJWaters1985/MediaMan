@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config, db, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 PASSWORD = os.environ.get("MEDIAMAN_PASSWORD", "")
 
@@ -42,6 +42,7 @@ async def basic_auth(request: Request, call_next):
 @app.on_event("startup")
 async def startup():
     db.conn()
+    db.requeue_interrupted()
     config.load()
     db.log("info", "app", f"MediaMan {VERSION} starting")
     await asyncio.to_thread(transcode.detect_hardware)
