@@ -155,3 +155,17 @@ def test_queue_pause_is_saved():
     assert config.get("queue_paused") is True
     transcode.worker.paused = False
     assert config.get("queue_paused") is False
+
+
+def test_dolby_vision_becomes_profile_8():
+    exp = {"hdr": True, "transfer": "smpte2084", "dovi": True, "dv_profile": 8}
+    good = {"color_transfer": "smpte2084", "dovi": True, "dv_profile": 8}
+    assert transcode.hdr_problem(exp, good) is None
+    assert "profile is 7" in transcode.hdr_problem(exp, dict(good, dv_profile=7))
+    saved = transcode.TOOLS["dovi_tool"]
+    transcode.TOOLS["dovi_tool"] = None
+    try:
+        ok, why = transcode.assess(S(**UHD, dovi=True, dv_profile=7))
+        assert not ok and "dovi_tool" in why
+    finally:
+        transcode.TOOLS["dovi_tool"] = saved

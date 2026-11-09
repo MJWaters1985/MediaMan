@@ -72,6 +72,8 @@ language and default/forced flags. MP4 `mov_text` becomes SRT; broadcast caption
 - for chunked encodes, exactly the source's frame count
 - the same audio tracks and channel counts, and the same number of subtitle tracks
 - the same HDR transfer, plus the mastering display, Dolby Vision and HDR10+ metadata where the source had them
+- for Dolby Vision, profile 8 (profile 7 and 8 sources are rewritten to 8.1 with `dovi_tool -m 2`, the
+  standard conversion; a single-layer file whose metadata still describes profile 7 often plays as plain HDR10)
 - a size at least `min savings` smaller
 
 If any of these fail, the result is thrown away and the original stays. If they pass, the result

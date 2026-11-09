@@ -139,7 +139,7 @@ def detect_hardware() -> dict:
 
 # ================================================================ planning
 TOOLS = {"vmaf": shutil.which("vmaf"), "hdr10plus_tool": shutil.which("hdr10plus_tool"),
-         "mkvmerge": shutil.which("mkvmerge")}
+         "mkvmerge": shutil.which("mkvmerge"), "dovi_tool": shutil.which("dovi_tool")}
 # CRF used when no VMAF search runs (visually transparent for most film content)
 DEFAULT_CRF = {"av1": {"uhd": 24, "hd": 23, "sd": 22}, "hevc": {"uhd": 20, "hd": 19, "sd": 18},
                "h264": {"uhd": 19, "hd": 18, "sd": 17}}
@@ -199,6 +199,8 @@ def assess(s: dict, force: bool = False) -> tuple[bool, str]:
             return False, f"{label} — DV profile 5 has no HDR10 base layer; left untouched"
         if tgt == "h264":
             return False, f"{label} — H.264 can't carry Dolby Vision"
+        if tgt == "hevc" and not (TOOLS["dovi_tool"] and TOOLS["mkvmerge"]):
+            return False, f"{label} — Dolby Vision conversion tools (dovi_tool, mkvmerge) unavailable"
     if s.get("hdr10plus"):
         if tgt != "hevc":
             return False, f"{label} — HDR10+ only survives as HEVC; set codec to auto or hevc"
@@ -508,7 +510,12 @@ def make_plan(path: str, s: dict, force: bool = False, crf: int | None = None) -
     expect = {"hdr": bool(s.get("hdr")), "transfer": s.get("color_transfer"),
               "mastering": bool(s.get("mastering")), "dovi": bool(s.get("dovi")),
               "hdr10plus": bool(s.get("hdr10plus"))}
-    plan.update(chunked=chunkable(s, backend, codec))
+    # HEVC Dolby Vision output is rewritten to profile 8.1 (dovi_tool mode 2): a single-layer stream whose
+    # RPU still describes profile 7's enhancement layer isn't valid, and many TVs drop to HDR10 on it
+    dv_convert = codec == "hevc" and bool(s.get("dovi"))
+    if dv_convert:
+        expect["dv_profile"] = 8
+    plan.update(chunked=chunkable(s, backend, codec), dv_convert=dv_convert)
     if plan["chunked"]:
         plan["note"] = ((plan.get("note") + "; ") if plan.get("note") else "") + \
             f"encoded in {CHUNK_SECONDS // 60 or 1}-minute chunks, so a restart resumes where it stopped"
@@ -528,6 +535,8 @@ def hdr_problem(expect: dict, out: dict) -> str | None:
         return "HDR10 mastering-display metadata lost"
     if expect.get("dovi") and not out.get("dovi"):
         return "Dolby Vision metadata lost"
+    if expect.get("dv_profile") and out.get("dv_profile") != expect["dv_profile"]:
+        return f"Dolby Vision profile is {out.get('dv_profile')}, expected {expect['dv_profile']}"
     if expect.get("hdr10plus") and not out.get("hdr10plus"):
         return "HDR10+ metadata lost"
     return None
@@ -776,8 +785,8 @@ class Worker:
             if os.path.exists(tmp):
                 os.unlink(tmp)
             return
-        if plan.get("hdr10plus_json"):
-            await self._inject_hdr10plus(jid, plan, s)
+        if plan.get("hdr10plus_json") or plan.get("dv_convert"):
+            await self._postprocess_hevc(jid, plan, s)
             if jid in self.cancelled:
                 return
         await self._verify_and_replace(jid, path, s, plan, force, orig_size)
@@ -939,6 +948,14 @@ class Worker:
         frames = sum(state["chunks"])
         if frames != expected:      # a misplaced chunk join would add or lose a frame there (audio drifts)
             plan["frame_problem"] = f"frame count changed ({expected} → {frames})"
+        if plan.get("dv_convert") and not state.get("dv_converted"):
+            db.x("UPDATE jobs SET message=? WHERE id=?", ("converting Dolby Vision metadata to profile 8.1", jid))
+            ok, err = await self._sh(jid, f"dovi_tool -m 2 convert -i {q(video)} -o {q(video + '.dv')} && "
+                                          f"mv -f {q(video + '.dv')} {q(video)}")
+            if not ok:
+                return False if jid in self.cancelled else self._fail(f"Dolby Vision conversion failed: {err[-400:]}")
+            state["dv_converted"] = True
+            self._save_state(wd, state)
         js = plan.get("hdr10plus_json")
         if js and not state.get("injected"):
             db.x("UPDATE jobs SET message=? WHERE id=?", ("injecting HDR10+ metadata", jid))
@@ -1003,27 +1020,33 @@ class Worker:
             return False, "cancelled"
         return proc.returncode == 0, (err or out or b"").decode(errors="ignore")
 
-    async def _inject_hdr10plus(self, jid: int, plan: dict, s: dict):
-        tmp, wd, js = plan["tmp"], plan["workdir"], plan["hdr10plus_json"]
-        enc, inj, out = (os.path.join(wd, x) for x in ("enc.hevc", "inj.hevc", "remux.mkv"))
+    async def _postprocess_hevc(self, jid: int, plan: dict, s: dict):
+        """Single-pass encodes: pull the HEVC stream out, convert DV to 8.1 and/or inject HDR10+, remux."""
+        tmp, wd, js = plan["tmp"], plan["workdir"], plan.get("hdr10plus_json")
+        cur, out = os.path.join(wd, "enc.hevc"), os.path.join(wd, "remux.mkv")
         q = shlex.quote
-        db.x("UPDATE jobs SET message=? WHERE id=?", ("injecting HDR10+ metadata", jid))
         fps = s.get("fps_rational") or "24000/1001"
-        steps = [
-            f"{q(probe.FFMPEG)} -nostdin -v error -y -i {q(tmp)} -map 0:V:0 -c copy -bsf:v hevc_mp4toannexb -f hevc {q(enc)}",
-            f"hdr10plus_tool inject -i {q(enc)} -j {q(js)} -o {q(inj)}",
-            f"rm -f {q(enc)}",
-            f"mkvmerge -q -o {q(out)} --default-duration 0:{fps}fps {q(inj)} -D {q(tmp)}; rc=$?; [ $rc -le 1 ]",
-            f"mv -f {q(out)} {q(tmp)}",
-        ]
-        for st in steps:
+        steps = [("extracting the video stream",
+                  f"{q(probe.FFMPEG)} -nostdin -v error -y -i {q(tmp)} -map 0:V:0 -c copy -bsf:v hevc_mp4toannexb "
+                  f"-f hevc {q(cur)}")]
+        if plan.get("dv_convert"):
+            steps.append(("converting Dolby Vision metadata to profile 8.1",
+                          f"dovi_tool -m 2 convert -i {q(cur)} -o {q(cur + '.x')} && mv -f {q(cur + '.x')} {q(cur)}"))
+        if js:
+            steps.append(("injecting HDR10+ metadata",
+                          f"hdr10plus_tool inject -i {q(cur)} -j {q(js)} -o {q(cur + '.x')} && mv -f {q(cur + '.x')} {q(cur)}"))
+        steps += [("remuxing", f"mkvmerge -q -o {q(out)} --default-duration 0:{fps}fps {q(cur)} -D {q(tmp)}; "
+                               f"rc=$?; [ $rc -le 1 ]"),
+                  ("remuxing", f"mv -f {q(out)} {q(tmp)} && rm -f {q(cur)}")]
+        for label, st in steps:
+            db.x("UPDATE jobs SET message=? WHERE id=?", (label, jid))
             ok, err = await self._sh(jid, st)
             if not ok:
                 if jid in self.cancelled:
                     return
                 if os.path.exists(tmp):
                     os.unlink(tmp)
-                raise RuntimeError(f"HDR10+ injection failed at '{st.split()[0]}': {err[-400:]}")
+                raise RuntimeError(f"{label} failed: {err[-400:]}")
 
     async def _crf_search(self, jid: int, path: str, s: dict, plan: dict) -> tuple[int, float, dict]:
         """Find the highest CRF whose sample encodes still reach the VMAF target (binary search)."""
