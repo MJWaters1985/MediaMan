@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import datetime as dt
 import json
 import os
@@ -729,6 +730,9 @@ class Worker:
             db.x("UPDATE jobs SET status='skipped', message=?, progress=1, finished=? WHERE id=?",
                  (plan["reason"], time.time(), jid))
             return
+        problem = space_problem(path, s, plan, orig_size)
+        if problem:
+            raise RuntimeError(problem)
         workdir = plan["workdir"]
         os.makedirs(workdir, exist_ok=True)
         keep = False
@@ -999,7 +1003,16 @@ class Worker:
             base = root or os.path.dirname(path)
             trash = os.path.join(base, ".mediaman-trash", os.path.relpath(path, base))
             os.makedirs(os.path.dirname(trash), exist_ok=True)
-            os.rename(path, trash)
+            try:
+                os.rename(path, trash)
+            except OSError as e:
+                if e.errno != errno.EXDEV:
+                    raise
+                # the file lives on its own dataset (e.g. Movies/4K): keep the trash on that dataset instead
+                here = os.path.dirname(path)
+                trash = os.path.join(here, ".mediaman-trash", os.path.basename(path))
+                os.makedirs(os.path.dirname(trash), exist_ok=True)
+                os.rename(path, trash)
             os.replace(tmp, final)
         else:
             os.replace(tmp, final)
@@ -1210,4 +1223,41 @@ class Worker:
         return rc == 0, err or f"exit code {rc}"
 
 
+def expected_output(s: dict, codec: str, orig_size: int) -> int:
+    """Rough size of the finished file: the planner's bits-per-pixel estimate, never below 15% of the source
+    (audio is copied as-is and can be several GB)."""
+    bpp = s.get("bpp") or 0
+    tgt_bpp = {"hevc": 0.06, "av1": 0.045, "h264": 0.085}.get(codec, 0.06) * (0.6 if s.get("height", 0) > 1800 else 1)
+    est = 1 - (tgt_bpp / bpp) if bpp else 0.5
+    return int(orig_size * max(0.15, min(1.0, 1 - est)))
+
+
+def space_problem(path: str, s: dict, plan: dict, orig_size: int) -> str | None:
+    """A transcode writes its work files and the new file next to the source, on the same dataset. At the
+    peak (joined video + audio/subtitles + final file) that's about twice the finished size."""
+    from .organizer import SPACE_MARGIN, free_bytes, gb
+    wd = plan.get("workdir") or os.path.dirname(path)
+    done = 0
+    try:      # a resumed job already has chunks on disk
+        done = sum(e.stat().st_size for e in os.scandir(wd) if e.is_file())
+    except OSError:
+        pass
+    need = max(0, 2 * expected_output(s, plan.get("codec") or "hevc", orig_size) - done) + SPACE_MARGIN
+    free = free_bytes(path)
+    if free is not None and free < need:
+        return (f"not enough free space on this file's dataset ({os.path.dirname(path)}): about {gb(need)} "
+                f"needed for the work files, {gb(free)} free")
+    return None
+
+
 worker = Worker()
+
+
+def startup_queue_policy() -> None:
+    """Called once at startup, before the worker runs: with "Resume transcoding after a restart" off, the queue
+    comes back paused (interrupted jobs are already back in it) and waits for Resume queue."""
+    if not config.get("resume_queue_on_startup") and not worker.paused:
+        worker.paused = True
+        waiting = (db.one("SELECT COUNT(*) n FROM jobs WHERE status='queued'") or {}).get("n", 0)
+        db.log("info", "transcode", f"queue paused at startup ({waiting} waiting) — \"Resume transcoding after a "
+                                    f"restart\" is off; use Resume queue to continue")

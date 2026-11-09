@@ -26,7 +26,6 @@ services:
       - /dev/dri:/dev/dri           # Intel QSV / VAAPI, AMD VAAPI. Remove if the NAS has no iGPU/GPU.
     environment:
       TZ: "Etc/UTC"                 # set to your timezone so the transcode time window is local
-      # MEDIAMAN_PASSWORD: "change-me"   # optional: require HTTP basic auth for the web UI
       # Optional HTTPS: PEM full-chain cert + key, paths as seen inside the container (e.g. under a
       # mounted folder). MediaMan restarts itself onto renewed files once no transcode is running.
       # MEDIAMAN_TLS_CERT: "/certs/fullchain.pem"

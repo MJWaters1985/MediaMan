@@ -91,11 +91,33 @@ def movie_folder(info: dict, movies_root: str, include_ids: bool) -> str:
     return name
 
 
-def build_path(info: dict, ext: str, movies_root: str, tv_root: str, include_ids: bool = True,
-               include_episode_title: bool = False) -> str | None:
+def _as_list(roots) -> list[str]:
+    return [r for r in ([roots] if isinstance(roots, str) else list(roots or [])) if r]
+
+
+def pick_root(info: dict, roots, prefer: str | None = None) -> str | None:
+    """Which library folder a title belongs in when there are several (one per pool/dataset):
+    the one that already has a folder for it (so a series never splits across pools), else `prefer`
+    (the folder a scanned file is already in), else the first (main) one."""
+    roots = _as_list(roots)
+    order = ([prefer] if prefer in roots else []) + [r for r in roots if r != prefer]
+    movie = info.get("type") == "movie"
+    for r in order:
+        if (info.get("year") or not movie) and find_existing_folder(r, info["title"], info.get("year")):
+            return r
+    return order[0] if order else None
+
+
+def build_path(info: dict, ext: str, movies_root, tv_root, include_ids: bool = True,
+               include_episode_title: bool = False, prefer_root: str | None = None) -> str | None:
+    """movies_root / tv_root: one folder or a list (main folder first)."""
     if not info.get("title"):
         return None
     ext = ext.lower()
+    movies_root = pick_root(info, movies_root, prefer_root) if info["type"] == "movie" else None
+    tv_root = pick_root(info, tv_root, prefer_root) if info["type"] != "movie" else None
+    if (movies_root if info["type"] == "movie" else tv_root) is None:
+        return None
     if info["type"] == "movie":
         folder = movie_folder(info, movies_root, include_ids)
         base = clean(info["title"]) + (f" ({info['year']})" if info.get("year") else "")

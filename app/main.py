@@ -2,38 +2,50 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
-import secrets
 import threading
 import time
+from urllib.parse import urlsplit
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import config, db, integrations, organizer, probe, tls, transcode, watcher
+from . import auth, config, db, fsbrowse, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.2.3"
+VERSION = "1.6.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
-PASSWORD = os.environ.get("MEDIAMAN_PASSWORD", "")
 
 app = FastAPI(title="MediaMan", version=VERSION)
 
 
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def cross_site(request: Request) -> bool:
+    """A change requested by another website (a form or script on a page the user has open). Browsers label every
+    request: Sec-Fetch-Site on current ones, Origin on older ones. Clients that send neither (curl, scripts) aren't
+    browsers acting for another site, so they're let through to the password check."""
+    site = request.headers.get("sec-fetch-site")
+    if site:
+        return site not in ("same-origin", "none")
+    origin = request.headers.get("origin")
+    if not origin:
+        return False
+    if origin == "null":
+        return True
+    hosts = {request.headers.get("host", "").lower(), request.headers.get("x-forwarded-host", "").lower()} - {""}
+    return urlsplit(origin).netloc.lower() not in hosts
+
+
 @app.middleware("http")
 async def basic_auth(request: Request, call_next):
-    if PASSWORD and request.url.path != "/healthz":
-        hdr = request.headers.get("authorization", "")
-        ok = False
-        if hdr.lower().startswith("basic "):
-            try:
-                _, _, pw = base64.b64decode(hdr[6:]).decode().partition(":")
-                ok = secrets.compare_digest(pw, PASSWORD)
-            except Exception:
-                ok = False
-        if not ok:
-            return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="MediaMan"'})
+    if request.method in UNSAFE_METHODS and cross_site(request):
+        return JSONResponse({"detail": "cross-site request refused"}, status_code=403)
+    if request.url.path != "/healthz" and not auth.authorized(request.headers.get("authorization", "")):
+        if request.headers.get("authorization"):
+            await asyncio.sleep(1)          # slow down guessing
+        return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="MediaMan"'})
     resp = await call_next(request)
     resp.headers["Cache-Control"] = "no-cache"   # revalidate UI files after an app update
     return resp
@@ -44,13 +56,29 @@ async def startup():
     db.conn()
     db.requeue_interrupted()
     config.load()
+    transcode.startup_queue_policy()
     db.log("info", "app", f"MediaMan {VERSION} starting")
+    if os.environ.get("MEDIAMAN_PASSWORD"):
+        db.log("warn", "app", "MEDIAMAN_PASSWORD is no longer supported and is ignored — set a password under "
+                              "Settings → Web UI password" + ("" if auth.state()["enabled"] else " (none is set now)"))
     await asyncio.to_thread(transcode.detect_hardware)
     asyncio.create_task(transcode.worker.loop())
     asyncio.create_task(watcher.loop())
+    asyncio.create_task(_housekeeping_loop())
     if tls.state["error"]:
         db.log("error", "tls", f"HTTPS requested but {tls.state['error']} — serving plain HTTP")
     asyncio.create_task(tls.watch_for_renewal(_busy, db.log, int(os.environ.get("MEDIAMAN_TLS_CHECK_SECONDS", "300"))))
+
+
+async def _housekeeping_loop():
+    while True:
+        try:
+            r = await asyncio.to_thread(db.housekeeping)
+            if any(r.values()):
+                db.log("info", "app", "housekeeping: removed " + ", ".join(f"{n} old {k}" for k, n in r.items() if n))
+        except Exception as e:
+            db.log("warn", "app", f"housekeeping failed: {e}")
+        await asyncio.sleep(86400)
 
 
 def _busy() -> bool:
@@ -72,9 +100,16 @@ def healthz():
 def status():
     def counts(sql):
         return {r["status"]: r["n"] for r in db.q(sql)}
-    paths = {k: {"path": config.get(k), "exists": os.path.isdir(config.get(k) or ""),
-                 "writable": os.access(config.get(k) or "/nonexistent", os.W_OK)}
-             for k in ("movies_dir", "tv_dir", "downloads_dir")}
+    def folder(p):
+        d = {"path": p, "exists": os.path.isdir(p or ""), "writable": os.access(p or "/nonexistent", os.W_OK)}
+        if d["exists"]:
+            d["free"] = organizer.free_bytes(p)
+        return d
+    paths = {}
+    for kind, label in (("movies", "movies"), ("tv", "tv")):
+        for i, p in enumerate(organizer.library_dirs(kind)):
+            paths[label if i == 0 else f"{label} {i + 1}"] = folder(p)
+    paths["downloads"] = folder(config.get("downloads_dir"))
     return {
         "version": VERSION,
         "hardware": transcode.hw,
@@ -91,12 +126,33 @@ def status():
         "paths": paths,
         "tls": {k: v for k, v in tls.state.items() if k != "sig"},
         "ffmpeg": probe.FFMPEG,
+        "auth": auth.state(),
     }
 
 
 @app.get("/api/settings")
 def get_settings():
     return config.public()
+
+
+@app.get("/api/fs")
+def browse_folders(path: str = ""):
+    """Folder picker for Settings -> Folders: subfolders of a mounted folder (or the list of mounted folders)."""
+    try:
+        return fsbrowse.listing(path or None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/auth/password")
+def change_password(body: dict = Body(...)):
+    """Set, change or remove (empty "new") the web UI password. The current one is required to change it."""
+    try:
+        auth.set_password(str(body.get("current") or ""), str(body.get("new") or ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    db.log("info", "app", "web UI password " + ("set" if body.get("new") else "removed"))
+    return auth.state()
 
 
 @app.put("/api/settings")
@@ -109,7 +165,7 @@ def put_settings(body: dict = Body(...)):
 
 @app.post("/api/settings/test/{what}")
 def test_integration(what: str):
-    fn = {"tmdb": integrations.tmdb_test, "jellyfin": integrations.jellyfin_test, "qbittorrent": integrations.qbit_test}.get(what)
+    fn = {"jellyfin": integrations.jellyfin_test, "qbittorrent": integrations.qbit_test}.get(what)
     if not fn:
         raise HTTPException(404)
     return {"result": fn()}

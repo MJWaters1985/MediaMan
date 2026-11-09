@@ -16,12 +16,19 @@ _apply_lock = threading.Lock()
 
 
 # ------------------------------------------------------------------ helpers
-def roots() -> list[tuple[str, str | None]]:
+def library_dirs(kind: str) -> list[str]:
+    """All library folders of one kind ("movies" / "tv"), the main one first."""
+    main = config.get("movies_dir" if kind == "movies" else "tv_dir")
+    more = config.get("movies_more_dirs" if kind == "movies" else "tv_more_dirs") or []
     out = []
-    if config.get("movies_dir"):
-        out.append((config.get("movies_dir"), "movies"))
-    if config.get("tv_dir"):
-        out.append((config.get("tv_dir"), "tv"))
+    for d in [main, *more]:
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def roots() -> list[tuple[str, str | None]]:
+    out = [(d, "movies") for d in library_dirs("movies")] + [(d, "tv") for d in library_dirs("tv")]
     for d in config.get("extra_scan_dirs") or []:
         out.append((d, None))
     return out
@@ -59,10 +66,13 @@ def _status_for(path: str, proposed: str | None) -> str:
 
 
 def propose(info: dict, path: str) -> str | None:
+    root, kind = root_for(path)
+    want = "movies" if info.get("type") == "movie" else "tv"
     return naming.build_path(
-        info, os.path.splitext(path)[1], config.get("movies_dir"), config.get("tv_dir"),
+        info, os.path.splitext(path)[1], library_dirs("movies"), library_dirs("tv"),
         include_ids=config.get("naming_include_ids"),
-        include_episode_title=config.get("naming_include_episode_title"))
+        include_episode_title=config.get("naming_include_episode_title"),
+        prefer_root=root if kind == want else None)
 
 
 def refresh_item(path: str, source: str, root: str | None, root_kind: str | None,
@@ -137,6 +147,32 @@ def override_item(item_id: int, fields: dict) -> dict | None:
 
 
 # ------------------------------------------------------------------ file operations
+SPACE_MARGIN = 2 * 1024 ** 3      # keep this much free on a dataset after copying into it
+
+
+def free_bytes(path: str) -> int | None:
+    """Free space where `path` would be written (ZFS reports a dataset's quota here)."""
+    p = path
+    while p and not os.path.exists(p):
+        p = os.path.dirname(p)
+    try:
+        return shutil.disk_usage(p or "/").free
+    except OSError:
+        return None
+
+
+def gb(n: int) -> str:
+    return f"{n / 1024 ** 3:.1f} GB"
+
+
+def _link_problem(e: OSError) -> str:
+    if e.errno == errno.EXDEV:
+        return "downloads and library are on different datasets or mounts"
+    if e.errno in (errno.EPERM, errno.EACCES):
+        return "the filesystem refused it (permissions)"
+    return e.strerror or str(e)
+
+
 def transfer(src: str, dst: str, mode: str) -> str:
     """copy | hardlink | move. Never touches permissions (ACL datasets refuse chmod)."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -144,7 +180,9 @@ def transfer(src: str, dst: str, mode: str) -> str:
         try:
             os.link(src, dst)
             return "hardlinked"
-        except OSError:
+        except OSError as e:
+            db.log("warn", "organize", f"hardlink not possible ({_link_problem(e)}) — copying instead: "
+                                       f"{os.path.basename(dst)}")
             mode = "copy"
     if mode == "move":
         try:
@@ -153,6 +191,11 @@ def transfer(src: str, dst: str, mode: str) -> str:
         except OSError as e:
             if e.errno != errno.EXDEV:
                 raise
+    # a real copy (also a move between datasets): make sure it fits before writing anything
+    need, free = os.path.getsize(src) + SPACE_MARGIN, free_bytes(dst)
+    if free is not None and free < need:
+        raise OSError(errno.ENOSPC, f"not enough free space in {os.path.dirname(dst)}: needs {gb(need)} "
+                                    f"(file + 2 GB margin), {gb(free)} free")
     tmp = os.path.join(os.path.dirname(dst), "." + os.path.basename(dst) + ".mediaman-part")
     try:
         with open(src, "rb") as fi, open(tmp, "wb") as fo:

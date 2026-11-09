@@ -90,12 +90,34 @@ def x(sql: str, args=()) -> int:
         return cur.lastrowid
 
 
+LOG_KEEP = 5000          # log rows kept in the database (the Log tab)
+_log_count = 0
+
+
 def log(level: str, area: str, msg: str) -> None:
-    print(f"[{level}] {area}: {msg}", flush=True)
-    x("INSERT INTO log(ts,level,area,msg) VALUES(?,?,?,?)", (time.time(), level, area, msg))
-    # keep the log bounded
-    if int(time.time()) % 50 == 0:
-        x("DELETE FROM log WHERE id < (SELECT MAX(id) - 5000 FROM log)")
+    global _log_count
+    # one line per event on stdout too (TrueNAS's app logs). Docker on TrueNAS doesn't rotate container logs,
+    # so nothing chatty goes here: ffmpeg's output stays in memory and only a summary is logged.
+    print(f"[{level}] {area}: {msg[:2000]}", flush=True)
+    x("INSERT INTO log(ts,level,area,msg) VALUES(?,?,?,?)", (time.time(), level, area, msg[:4000]))
+    _log_count += 1
+    if _log_count % 100 == 0:
+        x("DELETE FROM log WHERE id <= (SELECT MAX(id) - ? FROM log)", (LOG_KEEP,))
+
+
+def housekeeping() -> dict:
+    """Daily: keep the log bounded, drop expired lookups and cached probes of files that no longer exist."""
+    out = {}
+    with _lock:
+        c = conn()
+        out["log"] = c.execute("DELETE FROM log WHERE id <= (SELECT MAX(id) - ? FROM log)", (LOG_KEEP,)).rowcount
+        out["lookups"] = c.execute("DELETE FROM tmdb_cache WHERE ts < ?", (time.time() - 30 * 86400,)).rowcount
+        gone = [r[0] for r in c.execute("SELECT path FROM probes").fetchall() if not os.path.exists(r[0])]
+        for p in gone:
+            c.execute("DELETE FROM probes WHERE path=?", (p,))
+        out["probes"] = len(gone)
+        c.execute("PRAGMA optimize")
+    return out
 
 
 def jdump(o) -> str:

@@ -53,3 +53,98 @@ def test_qbit_new_style_login():
     assert "rejected" in integrations.qbit_test()
     assert integrations.qbit_completed_names() is None
     srv.shutdown()
+
+
+class FakeJellyfin(BaseHTTPRequestHandler):
+    """Mimics Jellyfin's /Items/RemoteSearch/{Movie,Series} (results in TMDb's order, plus OMDb rows without a Tmdb id)."""
+    DB = {"Movie": [("Dune", 2021, "438631"), ("Dune", 1984, "841"), ("Spider-Man: No Way Home", 2021, "634649"),
+                    ("Heat", 1995, "949")],
+          "Series": [("The Office", 2005, "2316"), ("The Office", 2001, "2996")]}
+    IMDB = {"tt0113277": "949"}
+    calls = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+        if 'Token="good"' not in (self.headers.get("Authorization") or ""):
+            self.send_response(401)
+            self.end_headers()
+            return
+        kind = self.path.rsplit("/", 1)[1]
+        si = body["SearchInfo"]
+        FakeJellyfin.calls.append((kind, si["Name"], si["Year"], si["ProviderIds"]))
+        ids = si["ProviderIds"]
+        rows = self.DB.get(kind, [])
+        if ids.get("Tmdb"):
+            rows = [r for r in rows if r[2] == ids["Tmdb"]]
+        elif ids.get("Imdb"):
+            rows = [r for r in rows if r[2] == self.IMDB.get(ids["Imdb"])]
+        else:
+            want = si["Name"].lower().replace("-", " ").replace(":", "")
+            rows = [r for r in rows if want.split()[0] in r[0].lower()]
+            if si["Year"]:
+                rows = [r for r in rows if r[1] == si["Year"]] + [r for r in rows if r[1] != si["Year"]]
+        out = [{"Name": n, "ProductionYear": y, "ProviderIds": {"Tmdb": t}, "SearchProviderName": "TheMovieDb"}
+               for n, y, t in rows] + [{"Name": "noise", "ProductionYear": 2000, "ProviderIds": {"Imdb": "tt1"}}]
+        data = json.dumps(out).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def _jellyfin(key="good"):
+    srv = HTTPServer(("127.0.0.1", 0), FakeJellyfin)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    config.update({"jellyfin_url": f"http://127.0.0.1:{srv.server_port}", "jellyfin_api_key": key,
+                   "identify_with_jellyfin": True})
+    from app import db
+    db.x("DELETE FROM tmdb_cache")
+    return srv
+
+
+def test_lookup_via_jellyfin():
+    srv = _jellyfin()
+    try:
+        m = integrations.enrich({"type": "movie", "title": "Dune", "year": 1984})
+        assert (m["ids"]["tmdb"], m["year"], m["tmdb_match"]) == ("841", 1984, True)
+        m = integrations.enrich({"type": "movie", "title": "Spider Man No Way Home", "year": 2021})
+        assert m["title"] == "Spider-Man: No Way Home" and m["ids"]["tmdb"] == "634649"
+        m = integrations.enrich({"type": "movie", "title": "Some Release", "ids": {"imdb": "tt0113277"}})
+        assert (m["title"], m["year"], m["ids"]["tmdb"]) == ("Heat", 1995, "949")
+        s = integrations.enrich({"type": "episode", "title": "The Office (US)", "season": 2, "episodes": [3]})
+        assert s["ids"]["tmdb"] == "2316" and s["title"] == "The Office"
+        n = integrations.enrich({"type": "movie", "title": "Zzqx Nothing", "year": 2019})
+        assert n["tmdb_match"] is False and "tmdb" not in n["ids"]
+        # cached: the same question isn't asked twice
+        before = len(FakeJellyfin.calls)
+        integrations.enrich({"type": "movie", "title": "Dune", "year": 1984})
+        assert len(FakeJellyfin.calls) == before
+    finally:
+        srv.shutdown()
+
+
+def test_lookup_off_or_failing_changes_nothing():
+    srv = _jellyfin(key="bad")
+    try:
+        info = integrations.enrich({"type": "movie", "title": "Dune", "year": 2021})
+        assert "tmdb_match" not in info and not info.get("ids", {}).get("tmdb")      # 401: left as identified
+        config.update({"jellyfin_api_key": "good", "identify_with_jellyfin": False})
+        before = len(FakeJellyfin.calls)
+        info = integrations.enrich({"type": "movie", "title": "Dune", "year": 2021})
+        assert "tmdb_match" not in info and len(FakeJellyfin.calls) == before       # switched off: not asked
+    finally:
+        srv.shutdown()
+
+
+def test_old_tmdb_key_is_dropped(tmp_path, monkeypatch):
+    f = tmp_path / "settings.json"
+    f.write_text(json.dumps({"settings_version": 2, "tmdb_api_key": "secret-value", "movies_dir": "/x"}))
+    monkeypatch.setattr(config, "SETTINGS_FILE", str(f))
+    monkeypatch.setattr(config, "_settings", None)
+    assert "tmdb_api_key" not in config.public() and config.get("movies_dir") == "/x"
+    assert "secret-value" not in f.read_text()
+    monkeypatch.setattr(config, "_settings", None)

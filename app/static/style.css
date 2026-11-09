@@ -86,6 +86,12 @@ dialog h2 { margin: 0 0 14px; font-size: 18px; }
 .form label { color: var(--muted); font-size: 13px; }
 .form .full { grid-column: 1 / -1; }
 .form .hint { grid-column: 2; font-size: 12px; color: var(--muted); margin-top: -6px; }
+.crumbs { font-size: 13px; margin-bottom: 8px; word-break: break-all; }
+button.link { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font: inherit; }
+.folder-list { border: 1px solid var(--line); border-radius: 10px; max-height: 50vh; overflow: auto; }
+button.folder { display: block; width: 100%; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line);
+  border-radius: 0; padding: 8px 12px; color: var(--text); cursor: pointer; }
+button.folder:hover { background: var(--panel2); }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 pre { background: var(--panel2); padding: 10px; border-radius: 8px; overflow: auto; font-size: 11px;
   white-space: pre-wrap; word-break: break-all; max-height: 260px; }

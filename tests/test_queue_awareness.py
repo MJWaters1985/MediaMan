@@ -54,3 +54,14 @@ def test_opening_db_does_not_requeue_running_jobs():
     db.requeue_interrupted()            # what the server does at startup
     assert db.one("SELECT status FROM jobs WHERE id=?", (jid,))["status"] == "queued"
     db.x("DELETE FROM jobs WHERE id=?", (jid,))
+
+
+def test_queue_paused_at_startup_when_resume_is_off():
+    from app import config, transcode
+    config.update({"queue_paused": False, "resume_queue_on_startup": True})
+    transcode.startup_queue_policy()
+    assert transcode.worker.paused is False                       # default: carries on
+    config.update({"resume_queue_on_startup": False})
+    transcode.startup_queue_policy()
+    assert transcode.worker.paused is True                        # off: comes back paused
+    config.update({"queue_paused": False, "resume_queue_on_startup": True})

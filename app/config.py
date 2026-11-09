@@ -8,13 +8,16 @@ import threading
 
 CONFIG_DIR = os.environ.get("MEDIAMAN_CONFIG", "/config")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
-SECRET_KEYS = {"tmdb_api_key", "jellyfin_api_key", "qbittorrent_password"}
+SECRET_KEYS = {"jellyfin_api_key", "qbittorrent_password"}
+RETIRED_KEYS = ("tmdb_api_key",)   # dropped on load: no longer used, and no longer masked
 MASK = "••••••••"
 
 DEFAULTS: dict = {
     # Library layout (paths as seen inside the container)
     "movies_dir": "/media/movies",
     "tv_dir": "/media/tv",
+    "movies_more_dirs": [],         # more Movies folders (other pools/datasets); files there stay where they are
+    "tv_more_dirs": [],             # more TV folders
     "extra_scan_dirs": [],          # unsorted folders to scan; proposals move files into movies/tv
     # qBittorrent finished-downloads watcher
     "downloads_dir": "/downloads",
@@ -26,10 +29,10 @@ DEFAULTS: dict = {
     "auto_transcode_imports": True,
     "min_video_size_mb": 50,        # smaller videos are treated as samples
     # Optional integrations
-    "tmdb_api_key": "",
     "jellyfin_url": "",
     "jellyfin_api_key": "",
     "jellyfin_verify_tls": True,
+    "identify_with_jellyfin": True,  # confirm titles/years and add TMDb IDs via Jellyfin's search
     "qbittorrent_url": "",
     "qbittorrent_username": "",
     "qbittorrent_password": "",
@@ -51,6 +54,7 @@ DEFAULTS: dict = {
     "min_savings_pct": 15,          # discard results that don't save at least this much
     "concurrent_jobs": 1,
     "queue_paused": False,          # Pause queue also freezes the running job; survives restarts
+    "resume_queue_on_startup": True,  # False: the queue comes back paused after a restart
     "transcode_window": "",         # e.g. "01:00-07:00"; empty = any time
     "keep_originals": False,        # move replaced originals to <dir>/.mediaman-trash instead of deleting
     "device_path": "/dev/dri/renderD128",
@@ -86,6 +90,10 @@ def load() -> dict:
                         data[k] = DEFAULTS[k]
                     migrated = True
             data["settings_version"] = DEFAULTS["settings_version"]
+            for k in RETIRED_KEYS:
+                if k in data:
+                    del data[k]
+                    migrated = True
             if migrated:
                 try:
                     with open(SETTINGS_FILE + ".tmp", "w") as f:

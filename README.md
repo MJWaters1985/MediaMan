@@ -22,7 +22,7 @@ Each file gets a confidence score built from every hint available:
 | Existing library structure | `Shows/The Office (US)/Season 2/03 - Office Olympics.mkv` |
 | Release / file names | `Severance.S01E03.1080p.ATVP.WEB-DL…`, season-pack folder names (via `guessit`) |
 | Embedded tags | `show`, `season_number`, `episode_sort` |
-| TMDb (optional API key) | Confirms the title and year, adds `[tmdbid-…]`, fills in episode titles |
+| TMDb, asked through Jellyfin | Confirms the title and year and adds `[tmdbid-…]`, using Jellyfin's own TMDb search (no TMDb account needed) |
 | Existing library folders | Reuses `The Office (US) (2005) [tvdbid-73244]` so you don't get a duplicate series folder |
 
 Samples, `Extras/`-style folders, and files under the minimum size are skipped. Downloads under the
@@ -100,6 +100,13 @@ restart. A job can also be paused on its own. Outside the *Only run between* win
 `01:00-07:00`) the running job is frozen the same way and continues when the window opens.
 Cancelling a job deletes its work folder.
 
+**Restarts and shutdowns:** stopping the app, restarting the app pool or shutting down the NAS sends
+MediaMan the normal container stop signal. It shuts down in about a second and keeps the finished
+chunks, so a chunked encode resumes from its last finished chunk (at most 2 minutes of video is
+re-encoded). Single-pass encodes (GPU, variable frame rate, AV1 Dolby Vision) start again from the
+beginning. With **Resume transcoding after a restart** off (Settings → Transcoding), the queue comes
+back paused instead and waits for *Resume queue*. A queue you paused yourself stays paused either way.
+
 **Stall watchdog:** ffmpeg with SVT-AV1 can occasionally deadlock (seen at the end of a chunk): the
 process stays alive and keeps reporting progress, but no new frames come out. An encoder that produces
 no new frame for 10 minutes while not paused is stopped. A chunk is then retried (up to 3 tries); a
@@ -121,12 +128,40 @@ single-pass encode moves on to its next attempt.
 
    Check the `group_add` IDs with `ls -ln /dev/dri`. For NVIDIA, use the commented `deploy` block.
 4. **Apps → Discover Apps → ⋮ → Install via YAML**, name it `mediaman`, and paste the YAML.
-5. Open `http://<nas>:8765`. Check **Overview → Folders** (each one should show *writable*) and
-   **Hardware**.
+5. Open `http://<nas>:8765`. Under **Settings → Folders**, use **Browse…** to pick the Movies, TV and
+   downloads folders (the picker lists only folders mounted into MediaMan and shows whether each is
+   writable). Then check **Overview → Folders** (each one should show *writable*) and **Hardware**.
 6. Optional, under **Settings**:
-   - TMDb API key: better matching and IDs.
-   - Jellyfin URL and API key: library refresh after imports and transcodes.
+   - Jellyfin URL and API key: library refresh after imports and transcodes, and title lookups
+     (Jellyfin's TMDb search confirms titles and years and adds TMDb IDs).
    - qBittorrent Web UI login: only import torrents that qBittorrent reports complete.
+
+### Several pools or datasets
+
+- **More Movies / TV folders** (Settings → Folders) adds library folders on other pools or datasets,
+  like the extra folders in a Jellyfin library. They're scanned as Movies or TV. A title goes to the
+  folder that already has it (a series is never split across pools); a new title goes to the main
+  folder; a file already in one of the extra folders stays there.
+- **Hardlinks** only work within one dataset *and* one mount. Between datasets MediaMan copies
+  instead and logs why. A move between datasets is a copy followed by a delete.
+- **Free space** is checked before copying into a dataset (file size + 2 GB) and before a transcode
+  (about twice the expected new file, because work files sit next to the source). Quotas count.
+  Overview → Folders shows each folder's free space.
+- **Keep originals**: the replaced file goes to `.mediaman-trash` at the top of the library folder,
+  or next to the file when it's on its own dataset (e.g. `Movies/4K`).
+
+### Logs
+
+The Log tab keeps the newest 5,000 entries. A daily clean-up also drops expired title lookups and
+cached file details for files that no longer exist. Each entry is also printed once to the app's
+TrueNAS log; TrueNAS doesn't rotate container logs, so MediaMan never prints encoder output there.
+
+### Password
+
+**Settings → Web UI password** turns on a password for the web UI (the browser asks for it; any user
+name works). It's stored as a salted scrypt hash in `auth.json` in the config folder, never in plain
+text. Changing or removing it needs the current password. Forgotten it? Delete `auth.json` from the
+config folder and restart the app. `/healthz` stays open for the container health check.
 
 ### HTTPS
 
@@ -170,5 +205,5 @@ docker run --rm -v "$PWD":/src:ro --entrypoint python mediaman:dev /src/tests/in
 
 The code lives in `app/`: `identify.py` (hints), `naming.py` (Jellyfin paths and sidecars),
 `organizer.py` (scan, propose, apply), `watcher.py` (downloads), `transcode.py` (hardware
-detection, planning, queue), `integrations.py` (TMDb, Jellyfin, qBittorrent), `main.py` (API), and
+detection, planning, queue), `integrations.py` (Jellyfin lookups and refresh, qBittorrent), `main.py` (API), and
 `static/` (UI).

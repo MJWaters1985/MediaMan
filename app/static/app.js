@@ -53,7 +53,7 @@ function renderOverview() {
     `<div>${esc(b)}</div><div>${Object.entries(caps).map(([c, v]) => `${c}${v["10bit"] ? " (10-bit)" : ""}`).join(", ")}</div>`).join("");
   const best = hw.best?.[s.target_codec];
   const pathRows = Object.entries(s.paths || {}).map(([k, v]) =>
-    `<div>${esc(k.replace("_dir", ""))}</div><div class="pathcheck"><span class="path">${esc(v.path)}</span> ${v.exists ? (v.writable ? '<span class="ok">✓ writable</span>' : '<span class="bad">read-only</span>') : '<span class="bad">missing</span>'}</div>`).join("");
+    `<div>${esc(k.replace("_dir", ""))}</div><div class="pathcheck"><span class="path">${esc(v.path)}</span> ${v.exists ? (v.writable ? '<span class="ok">✓ writable</span>' : '<span class="bad">read-only</span>') : '<span class="bad">missing</span>'}${v.free != null ? ` <span class="muted">· ${(v.free / 1024 ** 3).toFixed(0)} GB free</span>` : ""}</div>`).join("");
   const scan = s.scan || {};
   const items = s.items || {};
   const needs = (items.proposed || 0) + (items.unknown || 0) + (items.conflict || 0) + (items.error || 0);
@@ -130,8 +130,10 @@ $$("#lib-bulk [data-bulk]").forEach((b) => b.onclick = async () => {
   if (k === "ignore") { for (const id of ids) await api(`/api/items/${id}/ignore`, { method: "POST", body: {} }); toast(`Ignored ${ids.length}`); loadLibrary(); }
 });
 
+function lookupsOn() { return !!(SETTINGS.identify_with_jellyfin && SETTINGS.jellyfin_url && SETTINGS.jellyfin_api_key); }
+
 function rootOf(p) {
-  for (const k of ["movies_dir", "tv_dir", "downloads_dir", ...(SETTINGS.extra_scan_dirs || [])]) {
+  for (const k of ["movies_dir", "tv_dir", "downloads_dir", ...(SETTINGS.movies_more_dirs || []), ...(SETTINGS.tv_more_dirs || []), ...(SETTINGS.extra_scan_dirs || [])]) {
     const r = SETTINGS[k] || k; if (p && r && r.startsWith("/") && p.startsWith(r + "/")) return r;
   }
   return "";
@@ -196,7 +198,7 @@ async function editDialog(id) {
       <label class="ep">Episode(s)</label><input class="ep" name="episodes" value="${esc((i.episodes || []).join(","))}" placeholder="e.g. 3 or 3,4">
       <label class="mv">Edition</label><input class="mv" name="edition" value="${esc(i.edition || "")}" placeholder="e.g. Director's Cut">
       <label>TMDb ID</label><input name="tmdb" value="${esc(i.ids?.tmdb || "")}" inputmode="numeric">
-      <label></label><label><input type="checkbox" name="lookup" ${SETTINGS.tmdb_api_key ? "checked" : "disabled"}> Look up / confirm on TMDb${SETTINGS.tmdb_api_key ? "" : " (add an API key in Settings)"}</label>
+      <label></label><label><input type="checkbox" name="lookup" ${lookupsOn() ? "checked" : "disabled"}> Look up / confirm on TMDb${lookupsOn() ? " (via Jellyfin)" : " (set up Jellyfin in Settings)"}</label>
     </div>
     <div class="dlg-actions"><button value="cancel">Cancel</button><button value="reid" class="hide-sm">Re-run automatic</button><button value="save" class="primary">Save &amp; preview</button></div>`;
   const sync = () => { const ep = f.type.value === "episode"; $$(".ep", f).forEach((x) => x.style.display = ep ? "" : "none"); $$(".mv", f).forEach((x) => x.style.display = ep ? "none" : ""); };
@@ -289,10 +291,12 @@ async function loadQueue() {
 // ---------------------------------------------------------------- settings
 const FIELDS = [
   ["Folders (paths inside the container)", [
-    ["movies_dir", "Movies library", "text", "Jellyfin movies library host path, e.g. mounted at /media/movies"],
-    ["tv_dir", "TV library", "text", "Jellyfin shows library host path"],
-    ["extra_scan_dirs", "Extra folders to sort", "lines", "One per line. Files found here get proposals that move them into Movies/TV."],
-    ["downloads_dir", "qBittorrent finished folder", "text", ""],
+    ["movies_dir", "Movies library", "folder", "The folder Jellyfin's Movies library uses. Browse lists the folders mounted into MediaMan."],
+    ["movies_more_dirs", "More Movies folders", "folders", "Optional, one per line: other Movies folders (e.g. on another pool). Files there stay where they are; new imports go to the folder that already has that title, otherwise the Movies library above."],
+    ["tv_dir", "TV library", "folder", "The folder Jellyfin's Shows library uses."],
+    ["tv_more_dirs", "More TV folders", "folders", "Optional, one per line. A series is never split: new episodes go to whichever folder already has the show."],
+    ["extra_scan_dirs", "Extra folders to sort", "folders", "One per line. Files found here get proposals that move them into Movies/TV."],
+    ["downloads_dir", "qBittorrent finished folder", "folder", "Where qBittorrent puts finished downloads."],
   ]],
   ["Downloads watcher", [
     ["watcher_enabled", "Watch downloads", "bool", ""],
@@ -304,7 +308,7 @@ const FIELDS = [
     ["min_video_size_mb", "Min video size (MB)", "number", "Smaller videos in a download are treated as samples."],
   ]],
   ["Naming", [
-    ["naming_include_ids", "Add [tmdbid-…] to folders", "bool", "Helps Jellyfin match exactly. Needs TMDb or an existing ID."],
+    ["naming_include_ids", "Add [tmdbid-…] to folders", "bool", "Helps Jellyfin match exactly. Needs Jellyfin lookups or an existing ID."],
     ["naming_include_episode_title", "Episode titles in file names", "bool", ""],
     ["auto_apply_scan_min_confidence", "Auto-apply scan proposals ≥", "number", "0 = always wait for approval."],
   ]],
@@ -321,39 +325,114 @@ const FIELDS = [
     ["audio_policy", "Audio", "select:copy|eac3_lossless", "eac3_lossless converts TrueHD/DTS-HD/FLAC/PCM to EAC3 640k."],
     ["min_savings_pct", "Min savings (%)", "number", "Results that save less are discarded and the original kept."],
     ["concurrent_jobs", "Parallel jobs", "number", ""],
+    ["resume_queue_on_startup", "Resume transcoding after a restart", "bool", "On: after MediaMan, the app or the NAS restarts, interrupted jobs continue (chunked encodes from their last finished chunk). Off: the queue comes back paused until you press Resume queue. A queue you paused yourself stays paused either way."],
     ["transcode_window", "Only run between", "text", "e.g. 01:00-07:00. Empty = any time. Outside the window a running job is frozen mid-film and continues when it reopens."],
     ["keep_originals", "Keep originals", "bool", "Move replaced files into .mediaman-trash in the library instead of deleting them."],
     ["device_path", "GPU render node", "text", ""],
   ]],
   ["Integrations (optional)", [
-    ["tmdb_api_key", "TMDb API key", "secret", "v3 key or v4 read token — confirms titles/years, adds IDs, raises confidence.", "tmdb"],
-    ["jellyfin_url", "Jellyfin URL", "text", "e.g. https://nas.example:8920 — refreshes the library after changes."],
+    ["jellyfin_url", "Jellyfin URL", "text", "e.g. https://nas.example:8920 — refreshes the library after changes and looks up titles."],
     ["jellyfin_api_key", "Jellyfin API key", "secret", "Dashboard → API Keys", "jellyfin"],
     ["jellyfin_verify_tls", "Verify Jellyfin TLS", "bool", ""],
+    ["identify_with_jellyfin", "Look up titles via Jellyfin", "bool", "Uses Jellyfin's TMDb search (no TMDb account needed) to confirm titles and years, add TMDb IDs and raise confidence."],
     ["qbittorrent_url", "qBittorrent Web UI", "text", "Optional: only import torrents qBittorrent reports complete."],
     ["qbittorrent_username", "qBittorrent user", "text", ""],
     ["qbittorrent_password", "qBittorrent password", "secret", "", "qbittorrent"],
   ]],
 ];
+function passwordCard() {
+  const a = STATUS.auth || {};
+  return `<div class="card settings-group"><h3>Web UI password</h3>
+    <form id="pw-form" class="form" autocomplete="off">
+      <label>Status</label><div>${a.enabled ? "<b>On</b> — your browser asks for it (any user name)" : "<b>Off</b> — anyone who can reach this page can use MediaMan"}</div>
+      ${a.enabled ? '<label>Current password</label><input type="password" name="current" autocomplete="current-password">' : ""}
+      <label>New password</label><input type="password" name="new" autocomplete="new-password">
+      <label>Repeat new password</label><input type="password" name="new2" autocomplete="new-password">
+      <div class="hint">At least 8 characters. Stored only as a salted hash. Forgotten it? Delete <code>auth.json</code> from MediaMan's config folder and restart the app.</div>
+      <label></label><div style="display:flex;gap:8px"><button class="primary" type="submit">${a.enabled ? "Change password" : "Set password"}</button>${a.enabled ? '<button type="button" class="danger" id="pw-remove">Remove password</button>' : ""}</div>
+    </form></div>`;
+}
+
+async function savePassword(current, next) {
+  const r = await api("/api/auth/password", { method: "POST", body: { current, new: next } }).catch((e) => { toast("⚠ " + e.message); return null; });
+  if (!r) return;
+  toast(next ? "Password saved — sign in with it when your browser asks" : "Password removed");
+  setTimeout(() => location.reload(), 1200);
+}
+
+// Folder picker: only folders mounted into the container (TrueNAS host paths / volumes) can be browsed.
+async function folderPicker(start, onPick) {
+  const dlg = $("#dlg"), f = $("#dlg-form");
+  let cur = null;
+  const show = async (path, fallback) => {
+    let d;
+    try { d = await api("/api/fs?path=" + encodeURIComponent(path || "")); }
+    catch (e) { if (fallback !== undefined) return show(fallback); toast("⚠ " + e.message); return; }
+    cur = d.path;
+    const crumbs = d.path ? d.path.split("/").filter(Boolean).map((n, i, a) => "/" + a.slice(0, i + 1).join("/")) : [];
+    const inRoot = (p) => d.roots.some((r) => r === "/" || p === r || p.startsWith(r.replace(/\/$/, "") + "/"));
+    f.innerHTML = `<h2>Choose a folder</h2>
+      <div class="crumbs"><button type="button" class="link" data-go="">Mounted folders</button>${crumbs.map((c) => inRoot(c)
+        ? ` / <button type="button" class="link" data-go="${esc(c)}">${esc(c.split("/").pop())}</button>` : ` / <span class="muted">${esc(c.split("/").pop())}</span>`).join("")}</div>
+      <div class="folder-list">
+        ${d.parent ? `<button type="button" class="folder" data-go="${esc(d.parent)}">↑ Up</button>` : ""}
+        ${d.dirs.map((x) => `<button type="button" class="folder" data-go="${esc(x.path)}">📁 ${esc(x.name)}</button>`).join("") || '<div class="muted" style="padding:10px">No subfolders</div>'}
+        ${d.truncated ? '<div class="muted" style="padding:6px 10px">Showing the first 2000 folders</div>' : ""}
+      </div>
+      <p class="muted" style="margin:10px 0 0;font-size:12px">${d.path ? `${esc(d.path)} — ${d.writable ? "writable" : "<b>not writable</b> by MediaMan"}` : "These are the folders mounted into MediaMan. Add more in the app's storage settings in TrueNAS."}</p>
+      <div class="dlg-actions"><button value="cancel">Cancel</button><button value="pick" class="primary" ${d.path ? "" : "disabled"}>Use this folder</button></div>`;
+    $$("[data-go]", f).forEach((b) => b.onclick = () => show(b.dataset.go));
+  };
+  dlg.onclose = () => { if (dlg.returnValue === "pick" && cur) onPick(cur); dlg.onclose = null; };
+  dlg.returnValue = "";
+  await show(start, "");
+  if (!dlg.open) dlg.showModal();
+}
+
 function renderSettings() {
   const s = SETTINGS;
-  $("#settings").innerHTML = `<form id="set-form">${FIELDS.map(([title, fields]) => `
+  $("#settings").innerHTML = passwordCard() + `<form id="set-form">${FIELDS.map(([title, fields]) => `
     <div class="card settings-group"><h3>${esc(title)}</h3><div class="form">
     ${fields.map(([k, label, type, hint, test]) => {
       let input;
       if (type === "bool") input = `<label style="color:var(--text)"><input type="checkbox" name="${k}" ${s[k] ? "checked" : ""}> enabled</label>`;
       else if (type.startsWith("select:")) input = `<select name="${k}">${type.slice(7).split("|").map((o) => `<option ${s[k] === o ? "selected" : ""}>${o}</option>`).join("")}</select>`;
       else if (type === "lines") input = `<textarea name="${k}" rows="3">${esc((s[k] || []).join("\n"))}</textarea>`;
+      else if (type === "folders") input = `<div style="display:flex;gap:6px;align-items:flex-start"><textarea style="flex:1" name="${k}" rows="3">${esc((s[k] || []).join("\n"))}</textarea><button type="button" class="small" data-browse="${k}" data-add="1">Add folder…</button></div>`;
+      else if (type === "folder") input = `<div style="display:flex;gap:6px"><input style="flex:1" name="${k}" type="text" value="${esc(s[k] ?? "")}" autocomplete="off"><button type="button" class="small" data-browse="${k}">Browse…</button></div>`;
       else input = `<div style="display:flex;gap:6px"><input style="flex:1" name="${k}" type="${type === "secret" ? "password" : type === "number" ? "number" : "text"}" step="any" value="${esc(s[k] ?? "")}" autocomplete="off">${test ? `<button type="button" class="small" data-test="${test}">Test</button>` : ""}</div>`;
       return `<label>${esc(label)}</label>${input}${hint ? `<div class="hint">${esc(hint)}</div>` : ""}`;
     }).join("")}</div></div>`).join("")}
     <div class="toolbar"><button class="primary" type="submit">Save settings</button></div></form>`;
+  const pw = $("#pw-form");
+  if (pw) {
+    pw.onsubmit = (e) => {
+      e.preventDefault();
+      const f = e.target;
+      if (f.new.value.length < 8) return toast("⚠ Use at least 8 characters");
+      if (f.new.value !== f.new2.value) return toast("⚠ The new passwords don't match");
+      savePassword(f.current ? f.current.value : "", f.new.value);
+    };
+    const rm = $("#pw-remove");
+    if (rm) rm.onclick = () => {
+      if (!pw.current.value) return toast("⚠ Enter the current password to remove it");
+      if (confirm("Remove the password? Anyone who can reach MediaMan will be able to use it.")) savePassword(pw.current.value, "");
+    };
+  }
   $("#set-form").onsubmit = async (e) => {
     e.preventDefault();
     const body = {};
     FIELDS.flatMap((g) => g[1]).forEach(([k, , type]) => { const el = e.target[k]; body[k] = type === "bool" ? el.checked : type === "number" ? Number(el.value) : el.value; });
     SETTINGS = await act(() => api("/api/settings", { method: "PUT", body }), "Settings saved") || SETTINGS;
   };
+  $$("[data-browse]").forEach((b) => b.onclick = () => {
+    const el = $("#set-form")[b.dataset.browse];
+    const start = b.dataset.add ? (el.value.trim().split("\n").pop() || "") : el.value.trim();
+    folderPicker(start, (p) => {
+      if (b.dataset.add) { if (!el.value.split("\n").map((x) => x.trim()).includes(p)) el.value = (el.value.trim() ? el.value.trim() + "\n" : "") + p; }
+      else el.value = p;
+    });
+  });
   $$("[data-test]").forEach((b) => b.onclick = async () => {
     await api("/api/settings", { method: "PUT", body: Object.fromEntries(FIELDS.flatMap((g) => g[1]).filter((f) => f[0].startsWith(b.dataset.test)).map(([k, , t]) => [k, t === "bool" ? $("#set-form")[k].checked : $("#set-form")[k].value])) });
     const r = await api(`/api/settings/test/${b.dataset.test}`, { method: "POST" }).catch((e) => ({ result: e.message }));

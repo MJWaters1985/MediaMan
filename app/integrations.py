@@ -1,4 +1,4 @@
-"""Optional network integrations: TMDb lookups, Jellyfin library refresh, qBittorrent state."""
+"""Optional network integrations: title lookups and library refresh via Jellyfin, qBittorrent state."""
 from __future__ import annotations
 
 import difflib
@@ -10,46 +10,43 @@ import httpx
 from . import config, db
 from .identify import COUNTRY_SUFFIX, norm
 
-TMDB = "https://api.themoviedb.org/3"
+def lookups_enabled() -> bool:
+    return bool(config.get("identify_with_jellyfin") and _jf_url() and config.get("jellyfin_api_key"))
 
 
-def _tmdb_get(path: str, params: dict) -> dict | None:
-    key = config.get("tmdb_api_key")
-    if not key:
+def _jf_search(kind: str, name: str, year: int | None, ids: dict) -> list[dict] | None:
+    """Title search through Jellyfin's own metadata providers (its TMDb plugin, with Jellyfin's key), so MediaMan
+    needs no TMDb account. Returns TMDb hits as {id, title, year} in TMDb's ranking; None if Jellyfin can't be asked."""
+    if not lookups_enabled():
         return None
-    cache_key = path + "?" + json.dumps(params, sort_keys=True)
+    info = {"Name": name or "", "Year": year, "ProviderIds": ids}
+    cache_key = "jf:" + kind + json.dumps(info, sort_keys=True)
     row = db.one("SELECT data, ts FROM tmdb_cache WHERE q=?", (cache_key,))
     if row and time.time() - row["ts"] < 30 * 86400:
         return db.jload(row["data"])
-    headers, p = {}, dict(params)
-    if len(key) > 40:          # v4 read access token
-        headers["Authorization"] = f"Bearer {key}"
-    else:                      # v3 api key
-        p["api_key"] = key
     try:
-        r = httpx.get(TMDB + path, params=p, headers=headers, timeout=15)
-        if r.status_code == 404:
-            data = {}
-        else:
-            r.raise_for_status()
-            data = r.json()
+        r = httpx.post(_jf_url() + f"/Items/RemoteSearch/{kind}", headers=_jf_headers(), timeout=30,
+                       json={"SearchInfo": info, "IncludeDisabledProviders": True},
+                       verify=config.get("jellyfin_verify_tls"))
+        if r.status_code >= 400:
+            db.log("warn", "lookup", f"Jellyfin search failed for {name!r}: {_jf_explain(r)}")
+            return None
+        data = [{"id": str(x["ProviderIds"]["Tmdb"]), "title": x.get("Name") or "", "year": x.get("ProductionYear")}
+                for x in r.json() if (x.get("ProviderIds") or {}).get("Tmdb")]
     except Exception as e:
-        db.log("warn", "tmdb", f"lookup failed for {path}: {e}")
+        db.log("warn", "lookup", f"Jellyfin search failed for {name!r}: {e}")
         return None
     db.x("INSERT OR REPLACE INTO tmdb_cache(q,data,ts) VALUES(?,?,?)", (cache_key, json.dumps(data), time.time()))
     return data
 
 
-def _pick(results: list[dict], title: str, year: int | None, tkey: str, okey: str, dkey: str) -> dict | None:
+def _pick(results: list[dict], title: str, year: int | None) -> dict | None:
     best, best_score = None, 0.0
     want = norm(title)
     for i, r in enumerate(results[:10]):
-        names = {norm(r.get(tkey)), norm(r.get(okey))}
-        sim = max(difflib.SequenceMatcher(None, want, n).ratio() for n in names if n is not None)
-        ryear = int(r[dkey][:4]) if r.get(dkey) and r[dkey][:4].isdigit() else None
-        s = sim
-        if year and ryear:
-            s += 0.25 if ryear == year else (0.1 if abs(ryear - year) == 1 else -0.3)
+        s = difflib.SequenceMatcher(None, want, norm(r["title"])).ratio()
+        if year and r.get("year"):
+            s += 0.25 if r["year"] == year else (0.1 if abs(r["year"] - year) == 1 else -0.3)
         s -= i * 0.02          # TMDb's own ranking (popularity) breaks ties
         if s > best_score:
             best, best_score = r, s
@@ -57,77 +54,39 @@ def _pick(results: list[dict], title: str, year: int | None, tkey: str, okey: st
 
 
 def enrich(info: dict) -> dict:
-    """Confirm/canonicalise an identification against TMDb. No-op without an API key."""
-    if not config.get("tmdb_api_key") or not info.get("title"):
+    """Confirm/canonicalise an identification against TMDb, asked through Jellyfin. No-op when Jellyfin isn't set up."""
+    if not lookups_enabled() or not info.get("title"):
         return info
     ids = info.setdefault("ids", {})
-    if info["type"] == "movie":
-        hit = None
+    movie = info["type"] == "movie"
+    kind = "Movie" if movie else "Series"
+    title = info["title"] if movie else COUNTRY_SUFFIX.sub("", info["title"])
+    hit = None
+    known = {k.capitalize(): ids[k] for k in ("tmdb", "imdb", "tvdb") if ids.get(k)}
+    if known:
+        res = _jf_search(kind, title, info.get("year"), known)
+        if res is None:
+            return info
         if ids.get("tmdb"):
-            hit = _tmdb_get(f"/movie/{ids['tmdb']}", {})
-        elif ids.get("imdb"):
-            found = _tmdb_get(f"/find/{ids['imdb']}", {"external_source": "imdb_id"}) or {}
-            hit = (found.get("movie_results") or [None])[0]
-        if not hit:
-            params = {"query": info["title"]}
-            if info.get("year"):
-                params["year"] = info["year"]
-            res = _tmdb_get("/search/movie", params)
-            if res is None:
-                return info
-            results = res.get("results", [])
-            if not results and info.get("year"):
-                results = (_tmdb_get("/search/movie", {"query": info["title"]}) or {}).get("results", [])
-            hit = _pick(results, info["title"], info.get("year"), "title", "original_title", "release_date")
-        if hit and hit.get("id"):
-            info["title"] = hit.get("title") or info["title"]
-            if (hit.get("release_date") or "")[:4].isdigit():
-                info["year"] = int(hit["release_date"][:4])
-            ids["tmdb"] = str(hit["id"])
-            info["tmdb_match"] = True
+            hit = next((r for r in res if r["id"] == str(ids["tmdb"])), None)
         else:
-            info["tmdb_match"] = False
+            hit = res[0] if res else None
+    if not hit:
+        res = _jf_search(kind, title, info.get("year"), {})
+        if res is None:
+            return info
+        if not res and info.get("year"):
+            res = _jf_search(kind, title, None, {}) or []
+        hit = _pick(res, title, info.get("year"))
+    if hit:
+        info["title"] = hit["title"] or info["title"]
+        if hit.get("year"):
+            info["year"] = int(hit["year"])
+        ids["tmdb"] = hit["id"]
+        info["tmdb_match"] = True
     else:
-        hit = None
-        if ids.get("tmdb"):
-            hit = _tmdb_get(f"/tv/{ids['tmdb']}", {})
-        elif ids.get("tvdb") or ids.get("imdb"):
-            src, val = ("tvdb_id", ids["tvdb"]) if ids.get("tvdb") else ("imdb_id", ids["imdb"])
-            found = _tmdb_get(f"/find/{val}", {"external_source": src}) or {}
-            hit = (found.get("tv_results") or [None])[0]
-        if not hit:
-            params = {"query": COUNTRY_SUFFIX.sub("", info["title"])}
-            if info.get("year"):
-                params["first_air_date_year"] = info["year"]
-            res = _tmdb_get("/search/tv", params)
-            if res is None:
-                return info
-            results = res.get("results", [])
-            if not results and info.get("year"):
-                results = (_tmdb_get("/search/tv", {"query": params["query"]}) or {}).get("results", [])
-            hit = _pick(results, COUNTRY_SUFFIX.sub("", info["title"]), info.get("year"), "name", "original_name",
-                        "first_air_date")
-        if hit and hit.get("id"):
-            info["title"] = hit.get("name") or info["title"]
-            if (hit.get("first_air_date") or "")[:4].isdigit():
-                info["year"] = int(hit["first_air_date"][:4])
-            ids["tmdb"] = str(hit["id"])
-            info["tmdb_match"] = True
-            if info.get("episodes") and info.get("season") is not None:
-                ep = _tmdb_get(f"/tv/{hit['id']}/season/{info['season']}/episode/{info['episodes'][0]}", {})
-                if ep and ep.get("name"):
-                    info["episode_title"] = ep["name"]
-                elif ep == {}:
-                    info.setdefault("signals", []).append("episode-not-on-tmdb")
-                    info["tmdb_match"] = None
-        else:
-            info["tmdb_match"] = False
+        info["tmdb_match"] = False
     return info
-
-
-def tmdb_test() -> str:
-    r = _tmdb_get("/configuration", {})
-    return "ok" if r else "failed (check the key)"
 
 
 # ---------------------------------------------------------------- Jellyfin
