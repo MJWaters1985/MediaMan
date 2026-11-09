@@ -188,6 +188,10 @@ def apply_item(item_id: int) -> dict:
         if os.path.normpath(src) == os.path.normpath(dst):
             db.x("UPDATE items SET status=? WHERE id=?", ("applied" if item["source"] == "import" else "ok", item_id))
             return {"result": "already in place", "path": dst}
+        # an encode in progress writes next to the source and replaces it at the end; moving it now would
+        # leave the transcoded copy in the old folder and the original in the new one
+        if db.one("SELECT 1 FROM jobs WHERE path=? AND status IN ('running','paused')", (src,)):
+            raise ValueError("being transcoded — try again when it finishes")
         if not os.path.exists(src):
             db.x("UPDATE items SET status='error', message='source file missing' WHERE id=?", (item_id,))
             raise ValueError("source file missing")
@@ -236,7 +240,7 @@ def apply_item(item_id: int) -> dict:
             db.x("DELETE FROM items WHERE path=? AND id<>?", (dst, item_id))
             db.x("UPDATE items SET path=?, status='ok', message=?, updated=? WHERE id=?",
                  (dst, f"{how} from {src}", time.time(), item_id))
-            db.x("UPDATE jobs SET path=? WHERE path=? AND status IN ('queued','paused')", (dst, src))
+            db.x("UPDATE jobs SET path=? WHERE path=? AND status='queued'", (dst, src))
         else:
             db.x("UPDATE items SET status='applied', message=?, updated=? WHERE id=?",
                  (f"{how} to library", time.time(), item_id))

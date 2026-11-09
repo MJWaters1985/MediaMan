@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config, db, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 PASSWORD = os.environ.get("MEDIAMAN_PASSWORD", "")
 
@@ -125,6 +125,9 @@ def _item_out(r: dict) -> dict:
     r["info"] = db.jload(r["info"]) or {}
     k = db.one("SELECT size, reason FROM transcode_skips WHERE path=?", (r["path"],))
     r["skipped"] = k["reason"] if k and k["size"] == r["size"] else None
+    j = db.one("SELECT status, progress FROM jobs WHERE path=? AND status IN ('queued','running','paused') "
+               "ORDER BY id DESC LIMIT 1", (r["path"],))
+    r["job"] = j
     return r
 
 
