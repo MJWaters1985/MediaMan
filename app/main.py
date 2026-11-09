@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config, db, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 PASSWORD = os.environ.get("MEDIAMAN_PASSWORD", "")
 

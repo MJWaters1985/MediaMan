@@ -169,3 +169,31 @@ def test_dolby_vision_becomes_profile_8():
         assert not ok and "dovi_tool" in why
     finally:
         transcode.TOOLS["dovi_tool"] = saved
+
+
+def test_stalled_encoder_is_stopped(tmp_path, monkeypatch):
+    """An encoder that keeps printing progress with a frozen frame count (an ffmpeg/SVT-AV1 deadlock) is killed."""
+    import asyncio
+    import time
+    fake = tmp_path / "fake-ffmpeg"
+    fake.write_text("#!/bin/sh\nwhile true; do printf 'frame=42\\nout_time_us=1000000\\nprogress=continue\\n'; "
+                    "sleep 0.2; done\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(transcode, "STALL_SECONDS", 2)
+    w = transcode.Worker()
+    t0 = time.monotonic()
+    ok, err = asyncio.run(w._ffmpeg(999, [str(fake)], 100))
+    assert not ok and err.startswith(transcode.STALLED)
+    assert time.monotonic() - t0 < 10
+    assert w.procs[999].returncode is not None
+
+
+def test_progressing_encoder_is_left_alone(tmp_path, monkeypatch):
+    import asyncio
+    fake = tmp_path / "fake-ffmpeg"
+    fake.write_text("#!/bin/sh\ni=0\nwhile [ $i -lt 20 ]; do i=$((i+1)); printf 'frame=%s\\nprogress=continue\\n' $i; "
+                    "sleep 0.2; done\nexit 0\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(transcode, "STALL_SECONDS", 2)
+    ok, err = asyncio.run(transcode.Worker()._ffmpeg(998, [str(fake)], 100))
+    assert ok, err

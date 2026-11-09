@@ -100,6 +100,11 @@ restart. A job can also be paused on its own. Outside the *Only run between* win
 `01:00-07:00`) the running job is frozen the same way and continues when the window opens.
 Cancelling a job deletes its work folder.
 
+**Stall watchdog:** ffmpeg with SVT-AV1 can occasionally deadlock (seen at the end of a chunk): the
+process stays alive and keeps reporting progress, but no new frames come out. An encoder that produces
+no new frame for 10 minutes while not paused is stopped. A chunk is then retried (up to 3 tries); a
+single-pass encode moves on to its next attempt.
+
 ## Install on TrueNAS (Community Edition 25.04+)
 
 1. Copy this folder to the NAS, for example to `/mnt/<pool>/apps/mediaman-src`.

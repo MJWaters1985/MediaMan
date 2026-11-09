@@ -407,6 +407,8 @@ def build_command(src: str, dst: str, s: dict, backend: str, codec: str, mode: s
 
 
 CHUNK_SECONDS = 120         # content per chunk; a restart loses at most one chunk of work
+STALL_SECONDS = 600         # an unpaused encoder with no new frame for this long is deadlocked: stop it
+STALLED = "the encoder stalled"
 RAW_FORMAT = {"hevc": ("hevc", ".hevc"), "av1": ("obu", ".obu")}
 
 
@@ -912,9 +914,13 @@ class Worker:
                 out = os.path.join(wd, f"c{k:05d}{ext}")
                 db.x("UPDATE jobs SET message=? WHERE id=?",
                      (f"{plan['reason']} via cpu ({ENCODERS['software'][codec]}) — chunk {k + 1} of {total_chunks}", jid))
-                self.last.pop(jid, None)
-                ok, err = await self._ffmpeg(jid, chunk_command(path, out + ".part", s, codec, crf, done, n_per),
-                                             dur, offset=done / fps)
+                for retry in range(3):
+                    self.last.pop(jid, None)
+                    ok, err = await self._ffmpeg(jid, chunk_command(path, out + ".part", s, codec, crf, done, n_per),
+                                                 dur, offset=done / fps)
+                    if ok or jid in self.cancelled or not err.startswith(STALLED) or retry == 2:
+                        break
+                    db.log("warn", "transcode", f"{name}: chunk {k + 1} — {err}; retrying it")
                 if jid in self.cancelled:
                     return False
                 got = int(float((self.last.get(jid) or {}).get("frame") or 0))
@@ -1140,6 +1146,24 @@ class Worker:
         dtask = asyncio.create_task(drain())
         cur: dict[str, str] = {}
         last = 0.0
+        # watchdog: ffmpeg/SVT-AV1 can deadlock (seen at the end of a chunk) and keep printing progress with a
+        # frozen frame count forever. Time spent paused doesn't count.
+        seen = {"frame": None, "t": time.monotonic()}
+        stalled = []
+
+        async def watchdog():
+            while proc.returncode is None:
+                await asyncio.sleep(min(30, STALL_SECONDS / 4))
+                if self.frozen(jid):
+                    seen["t"] = time.monotonic()
+                elif time.monotonic() - seen["t"] > STALL_SECONDS and proc.returncode is None:
+                    stalled.append(True)
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    return
+        wtask = asyncio.create_task(watchdog())
 
         def num(v) -> float:
             try:
@@ -1155,6 +1179,8 @@ class Worker:
                 cur[k] = v
                 if k == "progress":
                     self.last[jid] = dict(cur)
+                    if cur.get("frame") != seen["frame"]:
+                        seen.update(frame=cur.get("frame"), t=time.monotonic())
                 if k == "progress" and time.time() - last > 2:
                     last = time.time()
                     t = offset + num(cur.get("out_time_us") or cur.get("out_time_ms")) / 1e6
@@ -1168,11 +1194,15 @@ class Worker:
             if proc.returncode is None:
                 os.killpg(proc.pid, signal.SIGKILL)
             raise
+        finally:
+            wtask.cancel()
         rc = await proc.wait()
         await dtask
         err = b"".join(err_buf).decode(errors="ignore").strip()
         if jid in self.cancelled:
             return False, "cancelled"
+        if stalled:
+            return False, f"{STALLED} (no new frames for {STALL_SECONDS // 60} min) and was stopped"
         if rc < 0:
             err = (f"the encoder was killed by signal {-rc}"
                    + (" — usually the system running out of memory" if -rc == signal.SIGKILL else "")
