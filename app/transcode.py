@@ -360,6 +360,11 @@ def _software_args(codec: str, depth: int, q: int, s: dict, full: bool = True) -
         params = ["log-level=error", "repeat-headers=1", "aq-mode=3", f"pools={limits()['cpus']}"]
         if hdr:
             params += ["hdr10=1", "hdr10-opt=1"]
+            # light levels explicitly, as for AV1: x265 only picks them up from the decoded stream, and many disc
+            # remuxes keep the real MaxCLL/MaxFALL in the Matroska container with zeros in the stream
+            mc, fa = (s.get("cll") or [0, 0])[:2]
+            if mc:
+                params.append(f"max-cll={mc},{fa}")
         if dv:   # x265 requires VBV limits when writing Dolby Vision
             kbps = min(max(int((s.get("vbitrate") or 0) / 1000), 20000), 120000)
             params += [f"vbv-maxrate={kbps}", f"vbv-bufsize={kbps * 2}"]
@@ -593,7 +598,7 @@ def make_plan(path: str, s: dict, force: bool = False, crf: int | None = None) -
                          "cmd": build_command(path, tmp, s, "software", codec, "sw", crf)})
     expect = {"hdr": bool(s.get("hdr")), "transfer": s.get("color_transfer"),
               "mastering": bool(s.get("mastering")), "dovi": bool(s.get("dovi")),
-              "hdr10plus": bool(s.get("hdr10plus"))}
+              "hdr10plus": bool(s.get("hdr10plus")), "cll": bool((s.get("cll") or [0])[0]) and bool(s.get("hdr"))}
     # HEVC Dolby Vision output is rewritten to profile 8.1 (dovi_tool mode 2): a single-layer stream whose
     # RPU still describes profile 7's enhancement layer isn't valid, and many TVs drop to HDR10 on it
     dv_convert = codec == "hevc" and bool(s.get("dovi"))
@@ -623,6 +628,8 @@ def hdr_problem(expect: dict, out: dict) -> str | None:
         return f"Dolby Vision profile is {out.get('dv_profile')}, expected {expect['dv_profile']}"
     if expect.get("hdr10plus") and not out.get("hdr10plus"):
         return "HDR10+ metadata lost"
+    if expect.get("cll") and not (out.get("cll") or [0])[0]:
+        return "HDR10 light levels (MaxCLL/MaxFALL) lost"
     return None
 
 

@@ -160,6 +160,24 @@ async def main():
         check("dv: output is HEVC Dolby Vision 8 with HDR10 base", o["vcodec"] == "hevc" and o["dovi"] and
               o["dv_profile"] == 8 and o["mastering"], f"profile={o['dv_profile']} transfer={o['color_transfer']}")
         check("dv: frame count identical", frames(job["path"]) == n, f"{n}")
+        check("dv: HDR10 light levels kept", o["cll"] == sd["cll"] and sd["cll"] != [0, 0],
+              f"source cll={sd['cll']} output cll={o['cll']}")
+
+    # 2c) light levels only in the Matroska container (zeros in the stream), as on many disc remuxes
+    config.update({"target_codec": "hevc"})
+    sh(f"{FF} -v error -y -f lavfi -i testsrc2=s=640x360:r=24000/1001:d=6 -c:v libx265 -preset ultrafast "
+       "-pix_fmt yuv420p10le -x265-params log-level=error:hdr10=1:colorprim=bt2020:transfer=smpte2084:"
+       "colormatrix=bt2020nc:master-display='G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)' "
+       "/tmp/nocll.mkv")
+    src = "/tmp/lib/src-container-cll.mkv"
+    sh(f"mkvmerge -q -o {src} --max-content-light 0:1000 --max-frame-light 0:400 /tmp/nocll.mkv; [ $? -le 1 ]")
+    sc = probe.summarize(probe.ffprobe(src, False))
+    jid3, _ = await run_job(src)
+    job = db.one("SELECT * FROM jobs WHERE id=?", (jid3,))
+    oc = probe.summarize(probe.ffprobe(job["path"], False)) if job["status"] == "done" else {}
+    check("container-only light levels kept (HEVC)", job["status"] == "done" and oc.get("cll") == sc["cll"] == [1000, 400],
+          f"source cll={sc['cll']} output cll={oc.get('cll')} — {job['message']}")
+    config.update({"target_codec": "auto"})
 
     # 3) Pause queue freezes the running job; resume continues it
     from app import config

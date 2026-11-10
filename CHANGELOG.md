@@ -2,6 +2,13 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.8.1 — 2026-11-10
+
+- Fixed: HEVC transcodes (Dolby Vision and HDR10+ titles) dropped the HDR10 light levels (MaxCLL/MaxFALL)
+  when the source kept them only in the Matroska container, as many disc remuxes do. They're now passed
+  to x265 explicitly, as they already were for AV1.
+- The check before a file is replaced now also refuses a result that lost the source's light levels.
+
 ## 1.8.0 — 2026-11-09
 
 First public release.

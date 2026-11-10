@@ -81,6 +81,23 @@ def test_command_streams_and_scaling():
     assert "-crf 27" in j and "-color_trc smpte2084" in j and "scale" not in j
 
 
+def test_hevc_gets_light_levels_explicitly():
+    """Disc remuxes often keep MaxCLL/MaxFALL only in the container; x265 must be told them."""
+    args = " ".join(transcode._software_args("hevc", 10, 20, S(**UHD)))
+    assert "max-cll=1000,400" in args
+    assert "max-cll" not in " ".join(transcode._software_args("hevc", 10, 20, S(**dict(UHD, cll=[0, 0]))))
+    assert "max-cll" not in " ".join(transcode._software_args("hevc", 10, 20, S()))          # SDR
+    assert "content-light=1000,400" in " ".join(transcode._software_args("av1", 10, 30, S(**UHD)))
+
+
+def test_lost_light_levels_are_refused():
+    exp = {"hdr": True, "transfer": "smpte2084", "mastering": True, "cll": True}
+    good = {"color_transfer": "smpte2084", "mastering": True, "cll": [1000, 400]}
+    assert transcode.hdr_problem(exp, good) is None
+    assert "light levels" in transcode.hdr_problem(exp, dict(good, cll=[0, 0]))
+    assert transcode.hdr_problem(dict(exp, cll=False), dict(good, cll=[0, 0])) is None      # source had none
+
+
 def test_hdr_verification():
     exp = {"hdr": True, "transfer": "smpte2084", "mastering": True, "dovi": True, "hdr10plus": False}
     good = {"color_transfer": "smpte2084", "mastering": True, "dovi": True}
