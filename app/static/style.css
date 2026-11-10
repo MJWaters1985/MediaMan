@@ -99,6 +99,13 @@ button.folder:hover { background: var(--panel2); }
 .setup-steps .done { color: var(--text); }
 .setup .ok { color: var(--ok); } .setup .bad { color: var(--bad); } .setup .warn { color: var(--warn); }
 body.in-setup #tabs { visibility: hidden; }
+.about-row { display: flex; gap: 14px; align-items: center; }
+.about-row .muted { font-size: 13px; margin-top: 2px; }
+.about-links { margin-top: 6px; font-size: 13px; }
+.about a { color: var(--accent); }
+.about a.coffee { display: inline-block; background: #ffdd00; color: #1b1f27; font-weight: 600; text-decoration: none;
+  padding: 8px 14px; border-radius: 8px; }
+.about a.coffee:hover { background: #ffe74d; }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 pre { background: var(--panel2); padding: 10px; border-radius: 8px; overflow: auto; font-size: 11px;
   white-space: pre-wrap; word-break: break-all; max-height: 260px; }

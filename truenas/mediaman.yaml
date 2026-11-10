@@ -1,12 +1,11 @@
 # MediaMan — TrueNAS custom app (Apps → Discover Apps → ⋮ → Install via YAML)
 #
 # Before installing:
-#   1. Build the image on the NAS:  sudo sh truenas/build-on-nas.sh   (creates mediaman:latest)
-#   2. Replace every /mnt/POOL/... path below with your real host paths:
+#   1. Replace every /mnt/POOL/... path below with your real host paths:
 #        - a dataset/folder for MediaMan's own config + database
 #        - one folder that contains your Jellyfin Movies and Shows folders AND qBittorrent's finished
 #          downloads (one mount lets imports use hardlinks); the setup wizard picks the folders inside it
-#   3. Check the GPU groups: `ls -ln /dev/dri` on the NAS shows the group IDs of card0/renderD128
+#   2. Check the GPU groups: `ls -ln /dev/dri` on the NAS shows the group IDs of card0/renderD128
 #      (TrueNAS is normally 44 = video, 107 = render). Keep them in group_add below.
 #
 # MediaMan runs as UID/GID 568 ("apps"), the same user TrueNAS runs Jellyfin and qBittorrent as,
@@ -14,8 +13,10 @@
 # library folders (and read access to the downloads folder).
 services:
   mediaman:
-    image: mediaman:latest
-    pull_policy: never              # image is built locally on the NAS
+    image: ghcr.io/mjwaters1985/mediaman:1     # newest 1.x release; pin e.g. :1.8.0 to stay put
+    # Running your own build instead? sudo sh truenas/build-on-nas.sh, then:
+    #   image: mediaman:latest
+    #   pull_policy: never
     container_name: mediaman
     restart: unless-stopped
     user: "568:568"

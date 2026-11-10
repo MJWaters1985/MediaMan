@@ -341,6 +341,23 @@ const FIELDS = [
     ["qbittorrent_password", "qBittorrent password", "secret", "", "qbittorrent"],
   ]],
 ];
+const REPO = "https://github.com/MJWaters1985/MediaMan";
+const COFFEE = "https://buymeacoffee.com/mjwaters1985";
+
+function aboutCard() {
+  const ext = (href, text) => `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+  return `<div class="card settings-group about"><h3>About</h3>
+    <div class="about-row"><img src="/static/icon.svg" alt="" width="56" height="56">
+      <div><div><b>MediaMan ${esc(STATUS.version || "")}</b></div>
+        <div class="muted">Organizes, imports and transcodes a Jellyfin library. Free software under the
+        ${ext(REPO + "/blob/main/LICENSE", "GNU GPL v3 or later")}. Copyright © 2026 Mike Waters.</div>
+        <div class="about-links">${ext(REPO, "Source code")} · ${ext(REPO + "/blob/main/CHANGELOG.md", "What's new")} · ${ext(REPO + "/issues", "Report a problem")}</div>
+      </div></div>
+    <p class="muted" style="margin:14px 0 8px">MediaMan is a free, one-person project. If it saves you time or disk space, you can support it:</p>
+    <a class="coffee" href="${COFFEE}" target="_blank" rel="noopener noreferrer">☕ Buy me a coffee</a>
+  </div>`;
+}
+
 function passwordCard() {
   const a = STATUS.auth || {};
   return `<div class="card settings-group"><h3>Web UI password</h3>
@@ -410,7 +427,7 @@ function renderSettings() {
       else input = `<div style="display:flex;gap:6px"><input style="flex:1" name="${k}" type="${type === "secret" ? "password" : type === "number" ? "number" : "text"}" step="any" value="${esc(s[k] ?? "")}" autocomplete="off">${test ? `<button type="button" class="small" data-test="${test}">Test</button>` : ""}</div>`;
       return `<label>${esc(label)}</label>${input}${hint ? `<div class="hint">${esc(hint)}</div>` : ""}`;
     }).join("")}</div></div>`).join("")}
-    <div class="toolbar"><button class="primary" type="submit">Save settings</button></div></form>`;
+    <div class="toolbar"><button class="primary" type="submit">Save settings</button></div></form>` + aboutCard();
   $("#rerun-setup").onclick = () => startSetup();
   const pw = $("#pw-form");
   if (pw) {

@@ -2,8 +2,15 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 1.8.0 — 2026-11-09
 
+First public release.
+
+- About section in Settings (version, license, source code, changelog, issues, and a Buy Me a Coffee
+  link); Support section in the README.
+- The README describes any download client (qBittorrent optional), Emby's shared layout, English folder
+  names, and which hardware encoders are untested. `truenas/mediaman.yaml` installs the published image
+  (`ghcr.io/mjwaters1985/mediaman`) instead of building on the NAS.
 - Screenshots in `docs/screenshots/` (taken from a demo library of open-licence and public-domain
   titles; `tools/make-demo-library.sh` recreates it).
 - New app icon: a blue gear with a gold ring around a bold "M" (SVG master plus 512 px, home-screen and

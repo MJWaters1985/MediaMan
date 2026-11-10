@@ -2,16 +2,27 @@
 
 # MediaMan
 
-A self-hosted media manager for a TrueNAS box running **Jellyfin** and **qBittorrent**. It sees the
-same host paths those apps use and:
+A self-hosted media manager for a TrueNAS box running **Jellyfin** (or Emby, which uses the same
+folder layout). It sees the same folders as your media server and download client, and:
 
 - **Scans your existing library**, works out what each file is, and proposes Jellyfin-correct folder
-  and file names. Nothing moves until you approve (or set an auto-apply confidence).
-- **Watches qBittorrent's finished folder**. A new download gets identified, **copied** into the
-  right library folder under its Jellyfin name, subtitles included, and queued for transcoding.
-  The original stays put so the torrent keeps seeding.
-- **Runs a transcode queue** that picks the encoder from the hardware it detects (NVENC, Intel QSV,
-  VAAPI, or CPU). It checks each result before replacing the original.
+  and file names. Nothing moves until you approve (or choose to rename automatically above a
+  confidence level).
+- **Watches your download client's finished folder.** Any client works: MediaMan waits until a
+  download's files stop changing. A new download is identified and **copied** (or hardlinked) into
+  the right library folder under its Jellyfin name, subtitles included. The original stays put so
+  it keeps seeding. With qBittorrent's Web UI connected, it also waits until qBittorrent reports the
+  download complete.
+- **Runs a transcode queue** that shrinks files while keeping their resolution, HDR (HDR10, HDR10+,
+  Dolby Vision), every audio track and every subtitle, aiming at a VMAF quality target. It checks
+  each result before replacing the original.
+
+**Hardware encoding:** software (CPU) encoding is what's been used most. AMD VAAPI has been tested
+on real hardware; Intel QSV and NVIDIA NVENC are supported by the bundled ffmpeg but haven't been
+tested on real hardware yet. Reports are welcome.
+
+**Language:** folder and file names follow Jellyfin's English conventions (`Season 01`, `Extras`,
+`Specials`).
 
 ![The transcode queue: a 4K HDR film encoding, three finished films each 84% smaller](docs/screenshots/4-transcode-queue.png)
 
@@ -127,25 +138,26 @@ single-pass encode moves on to its next attempt.
 
 ## Install on TrueNAS (Community Edition 25.04+)
 
-1. Copy this folder to the NAS, for example to `/mnt/<pool>/apps/mediaman-src`.
-2. Build the image over SSH:
+MediaMan isn't in the TrueNAS apps catalog yet. Until it is, install it as a custom app from the
+published image (`ghcr.io/mjwaters1985/mediaman`):
 
-   ```sh
-   sudo sh truenas/build-on-nas.sh
-   ```
-
-3. Edit `truenas/mediaman.yaml` and replace the `/mnt/POOL/...` paths with:
+1. Copy [`truenas/mediaman.yaml`](truenas/mediaman.yaml).
+2. Replace the `/mnt/POOL/...` paths with:
    - a folder for MediaMan's config and database
    - one folder that contains your Jellyfin Movies and Shows folders and your finished downloads,
      mounted at `/media` (a single mount lets imports use hardlinks)
 
    Check the `group_add` IDs with `ls -ln /dev/dri`. For NVIDIA, use the commented `deploy` block.
-4. **Apps → Discover Apps → ⋮ → Install via YAML**, name it `mediaman`, and paste the YAML.
-5. Open `http://<nas>:8765`. A setup wizard walks through the folders (picked with **Browse…** from
+3. **Apps → Discover Apps → ⋮ → Install via YAML**, name it `mediaman`, and paste the YAML.
+4. Open `http://<nas>:8765`. A setup wizard walks through the folders (picked with **Browse…** from
    what's mounted, each checked for write access), Jellyfin and qBittorrent (each with a Test
    button), the automation and safety settings, and an optional password. Nothing is imported or
    renamed until it's finished or skipped; **Settings → Run the setup wizard again** reopens it.
-6. Check **Overview → Folders** (each one should show *writable*) and **Hardware**.
+5. Check **Overview → Folders** (each one should show *writable*) and **Hardware**.
+
+To run your own build instead (development), copy the repository to the NAS, run
+`sudo sh truenas/build-on-nas.sh` (it builds `mediaman:latest`), and in the YAML use
+`image: mediaman:latest` with `pull_policy: never`.
 
 ### Several pools or datasets
 
@@ -240,6 +252,12 @@ The code lives in `app/`: `identify.py` (hints), `naming.py` (Jellyfin paths and
 `organizer.py` (scan, propose, apply), `watcher.py` (downloads), `transcode.py` (hardware
 detection, planning, queue), `integrations.py` (Jellyfin lookups and refresh, qBittorrent), `main.py` (API), and
 `static/` (UI).
+
+## Support
+
+MediaMan is a free, one-person project. Problems and ideas go in
+[GitHub issues](https://github.com/MJWaters1985/MediaMan/issues). If it saves you time or disk space,
+you can [buy me a coffee](https://buymeacoffee.com/mjwaters1985).
 
 ## License
 
