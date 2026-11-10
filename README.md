@@ -13,6 +13,11 @@ same host paths those apps use and:
 - **Runs a transcode queue** that picks the encoder from the hardware it detects (NVENC, Intel QSV,
   VAAPI, or CPU). It checks each result before replacing the original.
 
+![The transcode queue: a 4K HDR film encoding, three finished films each 84% smaller](docs/screenshots/4-transcode-queue.png)
+
+More: [Overview](docs/screenshots/1-overview.png) · [Library](docs/screenshots/2-library.png) ·
+[Downloads](docs/screenshots/3-downloads.png)
+
 ## How identification works
 
 Each file gets a confidence score built from every hint available:
@@ -213,6 +218,9 @@ a common parent folder once and point the three folder settings at subfolders. T
 the library file with a new one, so a hardlinked download is never affected.
 
 ## Development
+
+The screenshots in `docs/screenshots/` come from a demo library of open-licence and public-domain
+titles with synthetic video; `tools/make-demo-library.sh` recreates it.
 
 ```sh
 docker build -t mediaman:dev .

@@ -4,6 +4,8 @@ All notable changes to MediaMan. Versions follow [semantic versioning](https://s
 
 ## Unreleased
 
+- Screenshots in `docs/screenshots/` (taken from a demo library of open-licence and public-domain
+  titles; `tools/make-demo-library.sh` recreates it).
 - New app icon: a blue gear with a gold ring around a bold "M" (SVG master plus 512 px, home-screen and
   browser-tab PNGs).
 - First-run setup wizard: folders (with the folder picker and a write check), Jellyfin and qBittorrent
