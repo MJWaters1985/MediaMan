@@ -775,16 +775,20 @@ class Worker:
                 st["detail"] = detail
                 db.x("UPDATE jobs SET message=? WHERE id=?", (detail, jid))
             st["progress"] = progress
+            st.pop("bytes", None)
 
     def stage_view(self, jid: int) -> dict | None:
         st = self.stage.get(jid)
         if not st:
             return None
         return {"name": st["name"], "step": st["index"] + 1, "of": len(st["steps"]), "steps": st["steps"],
-                "detail": st["detail"], "progress": st["progress"], "elapsed": int(time.time() - st["started"])}
+                "detail": st["detail"], "progress": st["progress"], "bytes": st.get("bytes"),
+                "elapsed": int(time.time() - st["started"])}
 
     async def _watch_reads(self, jid: int, pgid: int, total: int):
-        """Progress of a step that reads a big file: the most any process of the step has read so far (rchar)."""
+        """Progress of a step that reads a big file: the most any process of the step has read so far (rchar),
+        with the read speed over the last 10 seconds and the time left at that speed."""
+        samples: list[tuple[float, int]] = []
         while True:
             await asyncio.sleep(2)
             most = 0
@@ -801,7 +805,14 @@ class Worker:
                     pass
             st = self.stage.get(jid)
             if st is not None and total:
+                most = min(most, total)
                 st["progress"] = min(0.99, most / total)
+                now = time.time()
+                samples = [s for s in samples if now - s[0] <= 10] + [(now, most)]
+                span = now - samples[0][0]
+                rate = (most - samples[0][1]) / span if span >= 1 else None
+                st["bytes"] = {"done": most, "total": total, "rate": rate,
+                               "eta": 0 if most >= total else int((total - most) / rate) if rate else None}
 
     def frozen(self, jid: int) -> bool:
         return jid in self.manual or jid in self.held

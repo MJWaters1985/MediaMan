@@ -12,7 +12,8 @@ All notable changes to MediaMan. Versions follow [semantic versioning](https://s
   installed starts over.
 - The transcode queue shows which step a job is on (for example *Step 2 of 7 · Counting frames*), that
   step's own progress (from how much of the file has been read, or the quality-search test) and time, and the
-  full list of steps.
+  full list of steps. Steps that read a big file (joining the chunks, adding metadata, writing the final
+  file, the final check) also show how much has been read, the read speed and the time left.
 - Error messages lead with the tool's actual error line instead of a cut-off tail.
 - Overview and the Transcode queue warn when the app's CPU or memory limits are too low for 4K transcodes,
   say how much to give it, and point to where TrueNAS sets them (*Apps → MediaMan → Edit → Resources

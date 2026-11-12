@@ -294,9 +294,12 @@ function jobProgress(j) {
   const p = encoding ? j.progress : st.progress;
   const bar = p != null ? `<div class="bar"><b style="width:${(p * 100).toFixed(1)}%"></b></div>` : `<div class="bar busy"><b></b></div>`;
   const stepLine = st ? `<div class="step"><b>Step ${st.step} of ${st.of} · ${esc(st.name)}</b>${st.detail ? " — " + esc(st.detail) : ""}${p != null && !encoding ? ` · ${(p * 100).toFixed(0)}%` : ""} · ${fmtDur(st.elapsed)}</div>` : "";
+  // steps that read a big file: how much, how fast, and how long is left at that speed
+  const b = !encoding && st?.bytes;
+  const readLine = b ? `<div class="meta">${fmtBytes(b.done)} of ${fmtBytes(b.total)}${b.rate ? ` · ${fmtBytes(b.rate)}/s` : ""}${b.eta != null ? ` · about ${fmtDur(Math.max(b.eta, 1))} left` : ""}</div>` : "";
   const enc = encoding ? `<div class="meta">${(j.progress * 100).toFixed(1)}% of the film${j.fps ? " · " + j.fps.toFixed(0) + " fps" : ""} ${esc(j.speed || "")}${j.eta ? " · " + fmtDur(j.eta) + " left" : ""}${st ? "" : " · " + esc(j.message || "")}</div>` : "";
   const steps = st ? `<div class="steps">${st.steps.map((n, i) => `<span class="${i + 1 < st.step ? "done" : i + 1 === st.step ? "on" : ""}">${esc(n)}</span>`).join("")}</div>` : "";
-  return stepLine + bar + enc + steps;
+  return stepLine + bar + readLine + enc + steps;
 }
 
 async function loadQueue() {

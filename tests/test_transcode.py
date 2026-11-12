@@ -334,10 +334,14 @@ def test_job_steps_are_reported():
         f.write(os.urandom(8 * 1024 * 1024))
         f.close()
         w._enter(7, "Final file")
-        ok, _ = await w._sh(7, f"cat {f.name} > /dev/null; sleep 3", read_total=8 * 1024 * 1024)
-        return ok, w.stage_view(7)["progress"]
-    ok, progress = asyncio.run(watched())
-    assert ok and progress and progress > 0.9
+        ok, _ = await w._sh(7, f"cat {f.name} > /dev/null; sleep 5", read_total=8 * 1024 * 1024)
+        return ok, w.stage_view(7)
+    ok, v = asyncio.run(watched())
+    assert ok and v["progress"] and v["progress"] > 0.9
+    b = v["bytes"]                        # with how much was read, out of how much, and the speed
+    assert b["done"] == b["total"] == 8 * 1024 * 1024 and b["rate"] is not None and b["eta"] == 0
+    w._detail(7, "next part")             # a new detail starts the read figures over
+    assert w.stage_view(7)["bytes"] is None
 
 
 def test_resource_advice_explains_low_limits(monkeypatch):
