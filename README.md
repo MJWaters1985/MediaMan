@@ -94,8 +94,12 @@ language and default/forced flags. MP4 `mov_text` becomes SRT; broadcast caption
 - for chunked encodes, exactly the source's frame count
 - the same audio tracks and channel counts, and the same number of subtitle tracks
 - the same HDR transfer, plus the mastering display, Dolby Vision and HDR10+ metadata where the source had them
-- for Dolby Vision, profile 8 (profile 7 and 8 sources are rewritten to 8.1 with `dovi_tool -m 2`, the
-  standard conversion; a single-layer file whose metadata still describes profile 7 often plays as plain HDR10)
+- for Dolby Vision, profile 8. The Dolby Vision metadata isn't passed through the encoder: `dovi_tool`
+  reads it from the original, converts it to 8.1 (`-m 2`, the standard conversion) and adds it to the new
+  video frame for frame. That works for every disc layout, including discs whose enhancement layer is
+  stored as Matroska block additions. A single-layer file whose metadata still describes profile 7 often
+  plays as plain HDR10, which is why profile 8 is required.
+- the HDR10 light levels (MaxCLL/MaxFALL), where the source had them
 - a size at least `min savings` smaller
 
 If any of these fail, the result is thrown away and the original stays. If they pass, the result
@@ -138,22 +142,42 @@ single-pass encode moves on to its next attempt.
 
 ## Install on TrueNAS (Community Edition 25.04+)
 
-MediaMan isn't in the TrueNAS apps catalog yet. Until it is, install it as a custom app from the
-published image (`ghcr.io/mjwaters1985/mediaman`):
+MediaMan is in the TrueNAS apps catalog (community train).
+
+1. **Apps → Discover Apps**, search for **MediaMan**, and click **Install**.
+2. Fill in the form:
+   - **Configuration Storage** holds MediaMan's settings, database and logs. The default ixVolume is fine.
+   - **Media Storage** defaults to an ixVolume, which is a new, empty dataset. For an existing library,
+     change **Type** to **Host Path** and pick the one folder that contains your Jellyfin Movies and
+     Shows folders and your finished downloads. It's mounted at `/media`, and a single mount lets
+     imports use hardlinks. Add other pools or datasets under **Additional Storage**.
+   - **WebUI Port** defaults to 30579.
+   - **Certificate** (optional) serves the web UI over HTTPS with one of TrueNAS's certificates.
+   - **Resources**: the defaults (2 CPUs, 4 GB) are enough for organizing and importing. For 4K
+     transcodes, give it 8 or more CPUs and 8–16 GB, and pass through a GPU if you have one.
+3. Click **Web UI** on the installed app. A setup wizard walks through:
+   - the folders, picked with **Browse…** from what's mounted, each checked for write access
+   - Jellyfin and qBittorrent, each with a Test button
+   - the automation and safety settings
+   - an optional password
+
+   Nothing is imported or renamed until it's finished or skipped. **Settings → Run the setup wizard
+   again** reopens it.
+4. Check **Overview → Folders** (each one should show *writable*) and **Hardware**.
+
+### Install via YAML instead
+
+To run the published image (`ghcr.io/mjwaters1985/mediaman`) as a custom app:
 
 1. Copy [`truenas/mediaman.yaml`](truenas/mediaman.yaml).
 2. Replace the `/mnt/POOL/...` paths with:
    - a folder for MediaMan's config and database
-   - one folder that contains your Jellyfin Movies and Shows folders and your finished downloads,
-     mounted at `/media` (a single mount lets imports use hardlinks)
+   - the folder that holds your Jellyfin Movies and Shows folders and your finished downloads,
+     mounted at `/media`
 
    Check the `group_add` IDs with `ls -ln /dev/dri`. For NVIDIA, use the commented `deploy` block.
 3. **Apps → Discover Apps → ⋮ → Install via YAML**, name it `mediaman`, and paste the YAML.
-4. Open `http://<nas>:8765`. A setup wizard walks through the folders (picked with **Browse…** from
-   what's mounted, each checked for write access), Jellyfin and qBittorrent (each with a Test
-   button), the automation and safety settings, and an optional password. Nothing is imported or
-   renamed until it's finished or skipped; **Settings → Run the setup wizard again** reopens it.
-5. Check **Overview → Folders** (each one should show *writable*) and **Hardware**.
+4. Open `http://<nas>:8765` and follow the setup wizard as above.
 
 To run your own build instead (development), copy the repository to the NAS, run
 `sudo sh truenas/build-on-nas.sh` (it builds `mediaman:latest`), and in the YAML use
@@ -186,6 +210,10 @@ TrueNAS log; TrueNAS doesn't rotate container logs, so MediaMan never prints enc
   parallelism (about 3 GB at the lowest level and 6 GB at level 4 for a 4K encode; its own automatic
   setting reached 18 GB on a 24-thread machine), so MediaMan picks the highest level that fits in half
   the memory limit, shared between parallel jobs. Overview → Hardware shows the CPUs and memory it sees.
+  The limits can only be changed in TrueNAS (*Apps → MediaMan → Edit → Resources Configuration*). When
+  they're too low for 4K transcodes (under 4 CPUs, or too little memory for the AV1 encoder), Overview and
+  the Transcode queue say so and suggest how much to give it. The catalog defaults (2 CPUs, 4 GB) are
+  enough for organizing and importing; for 4K transcodes, 8 or more CPUs and 8–16 GB work well.
 - **Encoder priority** (Settings → Transcoding, default *low*): encoders run at `nice 10` and the lowest
   best-effort disk priority, so file shares and Jellyfin playback stay responsive. Encodes only slow
   down while the NAS is busy with something else.
@@ -207,7 +235,10 @@ config folder and restart the app. `/healthz` stays open for the container healt
 
 ### HTTPS
 
-Set `MEDIAMAN_TLS_CERT` and `MEDIAMAN_TLS_KEY` to a PEM certificate (full chain) and key that
+In the catalog app, pick a **Certificate** in the app's settings. TrueNAS hands it to MediaMan,
+which is all that's needed.
+
+For a YAML install, set `MEDIAMAN_TLS_CERT` and `MEDIAMAN_TLS_KEY` to a PEM certificate (full chain) and key that
 the container can read. The UI is then served over HTTPS on the same port. MediaMan checks the
 files every 5 minutes. When a renewal tool replaces them, it waits until no transcode, scan or
 import is running, checks the new pair loads, and restarts itself onto it. If the files are
@@ -221,6 +252,10 @@ apps use). That user needs write access to the library folders and read access t
 folder. MediaMan never runs `chmod`/`chown`, and copies don't preserve the source permissions, so
 new files inherit the library dataset's ACL. This matters on SMB/ACL-managed datasets, where
 `chmod` is refused.
+
+In the catalog app, TrueNAS's permissions helper only sets up storage that's still empty, such as a
+new ixVolume; it skips folders that already have files in them, so an existing library keeps its
+owners and ACLs.
 
 ### Copy vs hardlink
 

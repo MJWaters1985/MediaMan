@@ -48,6 +48,7 @@ window.addEventListener("hashchange", () => { const t = location.hash.slice(1); 
 // ---------------------------------------------------------------- overview
 function renderOverview() {
   const s = STATUS, hw = s.hardware || {}, q = s.queue?.counts || {};
+  const res = s.resources || {};
   const be = hw.backends || {};
   const encRows = Object.entries(be).map(([b, caps]) =>
     `<div>${esc(b)}</div><div>${Object.entries(caps).map(([c, v]) => `${c}${v["10bit"] ? " (10-bit)" : ""}`).join(", ")}</div>`).join("");
@@ -87,10 +88,11 @@ function renderOverview() {
       <div class="kv">
         <div>Codec policy</div><div><b>${esc(s.target_codec === "auto" ? "auto (AV1 / HEVC for DV & HDR10+)" : (s.target_codec || "").toUpperCase())}</b></div>
         <div>GPU</div><div>${(hw.devices || []).map((d) => `${esc(d.vendor)} <span class="path">${esc(d.path)}</span>`).join("<br>") || "none passed through"}</div>
-        <div>CPU threads</div><div>${hw.cpu_count || "?"}${hw.memory ? ` · ${(hw.memory / 1024 ** 3).toFixed(0)} GB memory` : ""}</div>
+        <div>Limits</div><div>${res.cpus || hw.cpu_count || "?"} CPUs${(res.memory || hw.memory) ? ` · ${((res.memory || hw.memory) / 1024 ** 3).toFixed(0)} GB memory` : ""}</div>
         <div>Tools</div><div>${Object.entries(hw.tools || {}).map(([k, v]) => `${esc(k)} ${v ? "✓" : "✗"}`).join(" · ")}</div>
         ${encRows}
       </div>
+      ${resourceNote(res)}
       ${hw.error ? `<p style="color:var(--bad)">${esc(hw.error)}</p>` : ""}
       <div class="toolbar" style="margin:12px 0 0"><button id="ov-hw">Re-detect</button></div>
     </div>
@@ -99,6 +101,12 @@ function renderOverview() {
   $("#ov-scan").onclick = () => act(() => api("/api/scan", { method: "POST", body: {} }), "Scan started");
   $("#ov-cand").onclick = () => act(() => api("/api/jobs", { method: "POST", body: { all_candidates: true } }), (r) => `Queued ${r.queued} files`);
   $("#ov-hw").onclick = () => act(() => api("/api/hardware/detect", { method: "POST" }), "Hardware re-detected");
+}
+
+// CPU/memory limits too low for 4K transcodes, and where to change them (TrueNAS, not MediaMan)
+function resourceNote(r) {
+  if (!r?.warnings?.length) return "";
+  return `<div class="note warn">${r.warnings.map((w) => `<div>${esc(w)}</div>`).join("")}<div class="muted">${esc(r.hint)}</div></div>`;
 }
 
 function tlsRow(t) {
@@ -279,11 +287,24 @@ async function loadImports() {
 $("#q-toggle").onclick = () => act(() => api(`/api/queue/${STATUS.queue?.paused ? "resume" : "pause"}`, { method: "POST" }));
 $("#q-candidates").onclick = () => act(() => api("/api/jobs", { method: "POST", body: { all_candidates: true } }), (r) => `Queued ${r.queued} files`);
 $("#q-clear").onclick = () => act(() => api("/api/jobs", { method: "DELETE" }), "Cleared");
+// a running job: which step it's on, that step's own progress and time, and (while encoding) speed and time left
+function jobProgress(j) {
+  const st = j.stage;
+  const encoding = !st || st.name === "Encoding";
+  const p = encoding ? j.progress : st.progress;
+  const bar = p != null ? `<div class="bar"><b style="width:${(p * 100).toFixed(1)}%"></b></div>` : `<div class="bar busy"><b></b></div>`;
+  const stepLine = st ? `<div class="step"><b>Step ${st.step} of ${st.of} · ${esc(st.name)}</b>${st.detail ? " — " + esc(st.detail) : ""}${p != null && !encoding ? ` · ${(p * 100).toFixed(0)}%` : ""} · ${fmtDur(st.elapsed)}</div>` : "";
+  const enc = encoding ? `<div class="meta">${(j.progress * 100).toFixed(1)}% of the film${j.fps ? " · " + j.fps.toFixed(0) + " fps" : ""} ${esc(j.speed || "")}${j.eta ? " · " + fmtDur(j.eta) + " left" : ""}${st ? "" : " · " + esc(j.message || "")}</div>` : "";
+  const steps = st ? `<div class="steps">${st.steps.map((n, i) => `<span class="${i + 1 < st.step ? "done" : i + 1 === st.step ? "on" : ""}">${esc(n)}</span>`).join("")}</div>` : "";
+  return stepLine + bar + enc + steps;
+}
+
 async function loadQueue() {
   const jobs = await api("/api/jobs");
   const q = STATUS.queue || {};
   $("#q-toggle").textContent = q.paused ? "▶ Resume queue" : "⏸ Pause queue";
   $("#q-state").textContent = q.paused ? "Queue paused — the running job is frozen and continues when you resume" : !q.in_window ? `Outside transcode window (${SETTINGS.transcode_window}) — the running job is frozen until it opens` : "";
+  setHTML($("#q-resources"), resourceNote(STATUS.resources));
   if (!jobs.length) { setHTML($("#queue-list"), `<div class="empty">Queue is empty. Queue files from the Library tab or let imports add them.</div>`); return; }
   setHTML($("#queue-list"), jobs.map((j) => {
     const name = j.path.split("/").pop(), dir = j.path.split("/").slice(-3, -1).join("/");
@@ -298,8 +319,7 @@ async function loadQueue() {
         ${["failed", "cancelled"].includes(j.status) ? `<button class="small" data-a="job" data-id="${j.id}:retry">Retry</button>` : ""}
         ${j.status === "skipped" ? `<button class="small" data-a="job" data-id="${j.id}:force">Transcode anyway</button>` : ""}
       </div></div>
-      ${active ? `<div class="bar"><b style="width:${(j.progress * 100).toFixed(1)}%"></b></div>` : ""}
-      <div class="meta">${active ? `${(j.progress * 100).toFixed(1)}% · ${j.fps ? j.fps.toFixed(0) + " fps" : ""} ${esc(j.speed || "")}${j.eta ? " · " + fmtDur(j.eta) + " left" : ""} · ` : ""}${esc(j.message || j.reason || "")}${saved}${j.finished ? " · " + ago(j.finished) : ""}</div></div>`;
+      ${active ? jobProgress(j) : `<div class="meta">${esc(j.message || j.reason || "")}${saved}${j.finished ? " · " + ago(j.finished) : ""}</div>`}</div>`;
   }).join(""));
 }
 

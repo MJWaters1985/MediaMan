@@ -2,6 +2,24 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.8.3 — 2026-11-12
+
+- Fixed: some Dolby Vision profile 7 discs (with the enhancement layer stored as Matroska block additions)
+  failed on their first chunk, because ffmpeg couldn't hand their metadata to x265. The Dolby Vision
+  metadata is now read from the original with `dovi_tool`, converted to profile 8.1 and added to the new
+  video frame for frame; RPUs for undecodable leading frames are dropped, and any other mismatch fails the
+  job with the original kept. Bitrate limits are unchanged. A Dolby Vision job in progress when this is
+  installed starts over.
+- The transcode queue shows which step a job is on (for example *Step 2 of 7 · Counting frames*), that
+  step's own progress (from how much of the file has been read, or the quality-search test) and time, and the
+  full list of steps.
+- Error messages lead with the tool's actual error line instead of a cut-off tail.
+- Overview and the Transcode queue warn when the app's CPU or memory limits are too low for 4K transcodes,
+  say how much to give it, and point to where TrueNAS sets them (*Apps → MediaMan → Edit → Resources
+  Configuration*).
+- MediaMan is in the TrueNAS apps catalog: the README covers installing it from there (including
+  switching Media Storage to a Host Path for an existing library), with the YAML install as the alternative.
+
 ## 1.8.2 — 2026-11-12
 
 - Copies into the library show live progress: the Downloads page shows a progress bar on the download being

@@ -109,6 +109,13 @@ body.in-setup #tabs { visibility: hidden; }
 .copy { padding: 10px 14px; }
 .copy.compact { padding: 10px 0 0; }
 .copy .meta { font-size: 12px; color: var(--muted); }
+.job .step { font-size: 13px; margin-top: 6px; }
+.job .steps { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--muted); margin-top: 6px; }
+.job .steps .done { color: var(--text); }
+.job .steps .done::before { content: "✓ "; color: var(--ok); }
+.job .steps .on { color: var(--accent); font-weight: 600; }
+.bar.busy b { width: 30%; animation: busy 1.4s ease-in-out infinite; }
+@keyframes busy { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 pre { background: var(--panel2); padding: 10px; border-radius: 8px; overflow: auto; font-size: 11px;
   white-space: pre-wrap; word-break: break-all; max-height: 260px; }
@@ -127,3 +134,6 @@ pre { background: var(--panel2); padding: 10px; border-radius: 8px; overflow: au
   main { padding: 12px; } .form { grid-template-columns: 1fr; } .form .hint { grid-column: 1; }
   .hide-sm { display: none; } input[type=search] { min-width: 0; width: 100%; }
 }
+.note.warn { margin: 10px 0; padding: 8px 12px; border-left: 3px solid var(--warn); border-radius: 6px;
+  background: color-mix(in srgb, var(--warn) 10%, transparent); font-size: 13px; }
+.note.warn div + div { margin-top: 4px; }

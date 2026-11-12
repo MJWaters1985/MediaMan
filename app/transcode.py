@@ -5,6 +5,7 @@ import asyncio
 import errno
 import datetime as dt
 import json
+import math
 import os
 import re
 import shlex
@@ -116,6 +117,37 @@ def limits() -> dict:
 # SVT-AV1 peak memory per "level of parallelism" for a 4K 10-bit encode at preset 5 (measured: 2.9 / 3.7 /
 # 4.8 / 6.1 GB for levels 1-4; 5-6 extrapolated). Smaller frames need proportionally less.
 SVT_LP_GB_4K = {1: 3.0, 2: 3.8, 3: 4.9, 4: 6.2, 5: 8.0, 6: 10.0}
+
+
+RESOURCES_HINT = "TrueNAS sets these limits: Apps → MediaMan → Edit → Resources Configuration."
+
+
+def resource_advice() -> dict:
+    """The container's CPU and memory limits and, when they hold back 4K transcodes, why. MediaMan can't raise
+    them itself; they're set in the app's TrueNAS settings."""
+    lim = limits()
+    cpus, mem = lim["cpus"], lim["memory"]
+    jobs = max(1, int(config.get("concurrent_jobs") or 1))
+    want = 1 if cpus <= 2 else 2 if cpus <= 4 else 3 if cpus <= 8 else 4 if cpus <= 16 else 5 if cpus <= 32 else 6
+    level = svt_level({"width": 3840, "height": 2160})
+    warnings = []
+    if cpus < 4:
+        warnings.append(f"Only {cpus} CPU{'s' if cpus != 1 else ''}: 4K transcodes will be very slow "
+                        "(a 2-hour film can take a day or more). 8 or more CPUs are recommended.")
+    if mem:
+        gb = mem / 1024 ** 3
+        budget = gb / 2 / jobs
+        need = math.ceil(SVT_LP_GB_4K[want] * 2 * jobs)
+        if budget < SVT_LP_GB_4K[1]:
+            more = f"; about {need} GB lets it use all {cpus} CPUs" if want > 1 else ""
+            warnings.append(f"Only {gb:.0f} GB memory: tight for 4K AV1 transcodes, whose encoder alone can use "
+                            f"about {SVT_LP_GB_4K[1]:.0f} GB{' per job' if jobs > 1 else ''}. About "
+                            f"{math.ceil(SVT_LP_GB_4K[1] * 2 * jobs)} GB is recommended{more}.")
+        elif level < want:
+            warnings.append(f"{gb:.0f} GB memory holds the 4K AV1 encoder back to parallelism level {level} of "
+                            f"{want} for {cpus} CPUs. About {need} GB lets it use them all.")
+    return {"cpus": cpus, "memory": mem, "concurrent_jobs": jobs, "av1_4k_level": level, "av1_4k_level_max": want,
+            "warnings": warnings, "hint": RESOURCES_HINT if warnings else ""}
 
 
 def svt_level(s: dict) -> int:
@@ -368,9 +400,11 @@ def _software_args(codec: str, depth: int, q: int, s: dict, full: bool = True) -
         if dv:   # x265 requires VBV limits when writing Dolby Vision
             kbps = min(max(int((s.get("vbitrate") or 0) / 1000), 20000), 120000)
             params += [f"vbv-maxrate={kbps}", f"vbv-bufsize={kbps * 2}"]
+        # Dolby Vision metadata isn't handed to x265 (ffmpeg rejects some discs' RPUs there): it's taken from the
+        # source with dovi_tool and injected into the finished stream, see Worker._dv_from_source
         return ["-c:v", "libx265", "-preset", config.get("x265_preset") or "slow", "-crf", str(q),
                 "-pix_fmt", "yuv420p10le", "-profile:v", "main10", "-x265-params", ":".join(params),
-                "-dolbyvision", "1" if dv else "0"]
+                "-dolbyvision", "0"]
     return ["-c:v", "libx264", "-preset", "slow", "-crf", str(q), "-pix_fmt", "yuv420p", "-profile:v", "high"]
 
 
@@ -703,6 +737,7 @@ class Worker:
         self.manual: set[int] = set()     # jobs paused with their own Pause button
         self.held: set[int] = set()       # jobs frozen because the queue is paused / outside the time window
         self.last: dict[int, dict] = {}   # last ffmpeg progress block per job
+        self.stage: dict[int, dict] = {}  # the step a running job is on (shown in the queue)
 
     @property
     def paused(self) -> bool:
@@ -719,6 +754,54 @@ class Worker:
                 os.killpg(p.pid, sig)
             except ProcessLookupError:
                 pass
+
+    # ------------------------------------------------------------ steps (what a running job is doing)
+    def _steps(self, jid: int, names: list[str]):
+        self.stage[jid] = {"steps": names, "index": 0, "name": names[0] if names else "", "detail": None,
+                           "progress": None, "started": time.time()}
+
+    def _enter(self, jid: int, name: str, detail: str | None = None, progress: float | None = None):
+        steps = (self.stage.get(jid) or {}).get("steps") or []
+        if name not in steps:
+            steps = steps + [name]
+        self.stage[jid] = {"steps": steps, "index": steps.index(name), "name": name, "detail": detail,
+                           "progress": progress, "started": time.time()}
+        db.x("UPDATE jobs SET message=? WHERE id=?", (detail or name, jid))
+
+    def _detail(self, jid: int, detail: str | None = None, progress: float | None = None):
+        st = self.stage.get(jid)
+        if st is not None:
+            if detail is not None:
+                st["detail"] = detail
+                db.x("UPDATE jobs SET message=? WHERE id=?", (detail, jid))
+            st["progress"] = progress
+
+    def stage_view(self, jid: int) -> dict | None:
+        st = self.stage.get(jid)
+        if not st:
+            return None
+        return {"name": st["name"], "step": st["index"] + 1, "of": len(st["steps"]), "steps": st["steps"],
+                "detail": st["detail"], "progress": st["progress"], "elapsed": int(time.time() - st["started"])}
+
+    async def _watch_reads(self, jid: int, pgid: int, total: int):
+        """Progress of a step that reads a big file: the most any process of the step has read so far (rchar)."""
+        while True:
+            await asyncio.sleep(2)
+            most = 0
+            for d in os.listdir("/proc"):
+                if not d.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{d}/stat") as f:
+                        if int(f.read().rsplit(")", 1)[1].split()[2]) != pgid:
+                            continue
+                    with open(f"/proc/{d}/io") as f:
+                        most = max(most, next(int(l.split()[1]) for l in f if l.startswith("rchar:")))
+                except (OSError, ValueError, IndexError, StopIteration):
+                    pass
+            st = self.stage.get(jid)
+            if st is not None and total:
+                st["progress"] = min(0.99, most / total)
 
     def frozen(self, jid: int) -> bool:
         return jid in self.manual or jid in self.held
@@ -836,25 +919,38 @@ class Worker:
             keep = bool(plan.get("chunked")) and jid not in self.cancelled
             raise
         finally:
+            self.stage.pop(jid, None)
             if not keep:
                 shutil.rmtree(workdir, ignore_errors=True)
 
     async def _encode_and_replace(self, jid: int, path: str, s: dict, plan: dict, force: bool, orig_size: int):
         state = self._load_state(path, s, plan) if plan.get("chunked") else {}
         js = plan.get("hdr10plus_json")
+        chunked, dv = bool(plan.get("chunked")), bool(plan.get("dv_convert"))
+        names = (["Reading HDR10+ metadata"] if js and not os.path.exists(js) else []) + \
+                (["Quality search"] if plan.get("search") and not state.get("vmaf") else []) + \
+                (["Counting frames"] if chunked and not state.get("src_frames") else []) + ["Encoding"] + \
+                (["Joining chunks"] if chunked and not state.get("joined") else []) + \
+                (["Preparing the video stream"] if not chunked and (js or dv) else []) + \
+                (["Dolby Vision metadata"] if dv else []) + (["HDR10+ metadata"] if js else []) + \
+                (["Audio and subtitles"] if chunked else []) + (["Final file"] if chunked or js or dv else []) + \
+                ["Checking the result"]
+        self._steps(jid, names)
+        src_size = os.path.getsize(path)
         if js and not os.path.exists(js):
-            db.x("UPDATE jobs SET message=? WHERE id=?", ("extracting HDR10+ metadata", jid))
+            self._enter(jid, "Reading HDR10+ metadata", "reading the HDR10+ metadata from the whole film")
             ok, err = await self._sh(jid, f"{shlex.quote(probe.FFMPEG)} -nostdin -v error -i {shlex.quote(path)} "
                                           f"-map 0:V:0 -c:v copy -bsf:v hevc_mp4toannexb -f hevc - | "
-                                          f"hdr10plus_tool extract -o {shlex.quote(js + '.part')} -")
+                                          f"hdr10plus_tool extract -o {shlex.quote(js + '.part')} -", read_total=src_size)
             if not ok or not os.path.exists(js + ".part") or not os.path.getsize(js + ".part"):
-                raise RuntimeError(f"HDR10+ metadata extraction failed: {err[-400:]}")
+                raise RuntimeError(f"HDR10+ metadata extraction failed: {err_summary(err)}")
             os.replace(js + ".part", js)
         if state.get("vmaf"):
             plan = await asyncio.to_thread(make_plan, path, s, force, state["vmaf"]["crf"])
             plan["vmaf"] = state["vmaf"]
             db.x("UPDATE jobs SET plan=? WHERE id=?", (db.jdump(plan | {"force": force}), jid))
         elif plan.get("search"):
+            self._enter(jid, "Quality search", "cutting sample clips")
             crf, score, tried = await self._crf_search(jid, path, s, plan)
             if jid in self.cancelled:
                 return
@@ -870,28 +966,29 @@ class Worker:
         for att in plan["attempts"]:
             if jid in self.cancelled:
                 break
-            db.x("UPDATE jobs SET message=? WHERE id=?", (f"{plan['reason']} via {att['label']}", jid))
+            self._enter(jid, "Encoding", f"{plan['reason']} via {att['label']}")
             ok, err = await self._ffmpeg(jid, att["cmd"], s.get("duration") or 0)
             if ok:
                 break
             errors.append(f"{att['label']}: {err}")
             if os.path.exists(tmp):
                 os.unlink(tmp)
-            db.log("warn", "transcode", f"{os.path.basename(path)} — {att['label']} failed: {err[-300:]}")
+            db.log("warn", "transcode", f"{os.path.basename(path)} — {att['label']} failed: {err_summary(err)}")
         else:
-            raise RuntimeError("all attempts failed: " + " | ".join(e[-400:] for e in errors))
+            raise RuntimeError("all attempts failed: " + " | ".join(err_summary(e) for e in errors))
         if jid in self.cancelled:
             if os.path.exists(tmp):
                 os.unlink(tmp)
             return
         if plan.get("hdr10plus_json") or plan.get("dv_convert"):
-            await self._postprocess_hevc(jid, plan, s)
+            await self._postprocess_hevc(jid, path, plan, s)
             if jid in self.cancelled:
                 return
         await self._verify_and_replace(jid, path, s, plan, force, orig_size)
 
     async def _verify_and_replace(self, jid: int, path: str, s: dict, plan: dict, force: bool, orig_size: int):
         tmp = plan["tmp"]
+        self._enter(jid, "Checking the result", "checking the new file before it replaces the original")
         out = probe.summarize(await asyncio.to_thread(probe.ffprobe, tmp, False))
         new_size = os.path.getsize(tmp)
         dur_in, dur_out = s.get("duration") or 0, out.get("duration") or 0
@@ -976,7 +1073,7 @@ class Worker:
         q = shlex.quote
         if not state.get("src_frames"):
             # exact count of the source's video frames (reads the whole file once, no decoding); tags can be stale
-            db.x("UPDATE jobs SET message=? WHERE id=?", ("counting source frames", jid))
+            self._enter(jid, "Counting frames", "reading the whole film to count its frames exactly")
             # packets in the whole file, minus frames the decoder discards at the very start (a file cut on an
             # open GOP begins with frames that reference the missing previous GOP)
             cnt, head = os.path.join(wd, "frames.txt"), os.path.join(wd, "head.txt")
@@ -985,7 +1082,7 @@ class Worker:
                                           f"-show_entries stream=nb_read_packets -of csv=p=0 {q(path)} > {q(cnt)} && "
                                           f"{fp} -v error -select_streams V:0 -read_intervals %+10 -count_packets "
                                           f"-count_frames -show_entries stream=nb_read_packets,nb_read_frames "
-                                          f"-of json {q(path)} > {q(head)}")
+                                          f"-of json {q(path)} > {q(head)}", read_total=os.path.getsize(path))
             try:
                 total = int(open(cnt).read().strip().strip(",").split()[0])
                 h = json.load(open(head))["streams"][0]
@@ -993,7 +1090,7 @@ class Worker:
             except (OSError, ValueError, IndexError, KeyError):
                 ok = False
             if not ok:
-                return False if jid in self.cancelled else self._fail(f"couldn't count source frames: {err[-300:]}")
+                return False if jid in self.cancelled else self._fail(f"couldn't count source frames: {err_summary(err)}")
         expected = state["src_frames"]
         dur = expected / fps
         total_chunks = max(1, -(-expected // n_per))
@@ -1012,8 +1109,11 @@ class Worker:
                     return False
                 k = len(chunks)
                 out = os.path.join(wd, f"c{k:05d}{ext}")
-                db.x("UPDATE jobs SET message=? WHERE id=?",
-                     (f"{plan['reason']} via cpu ({ENCODERS['software'][codec]}) — chunk {k + 1} of {total_chunks}", jid))
+                msg = f"{plan['reason']} via cpu ({ENCODERS['software'][codec]}) — chunk {k + 1} of {total_chunks}"
+                if (self.stage.get(jid) or {}).get("name") != "Encoding":
+                    self._enter(jid, "Encoding", msg)
+                else:
+                    self._detail(jid, msg)
                 for retry in range(3):
                     self.last.pop(jid, None)
                     ok, err = await self._ffmpeg(jid, chunk_command(path, out + ".part", s, codec, crf, done, n_per),
@@ -1026,7 +1126,7 @@ class Worker:
                 got = int(float((self.last.get(jid) or {}).get("frame") or 0))
                 empty = not os.path.exists(out + ".part") or not os.path.getsize(out + ".part") or not got
                 if not ok and not (empty and done >= expected - 2):
-                    raise RuntimeError(f"chunk {k + 1} failed: {err[-400:]}")
+                    raise RuntimeError(f"chunk {k + 1} failed: {err_summary(err)}")
                 if empty:
                     if os.path.exists(out + ".part"):
                         os.unlink(out + ".part")
@@ -1039,11 +1139,13 @@ class Worker:
                     break
             if not chunks:
                 raise RuntimeError("the encoder produced no video")
-            db.x("UPDATE jobs SET message=? WHERE id=?", ("joining chunks", jid))
+            self._enter(jid, "Joining chunks", f"joining {len(chunks)} chunks into one video stream")
             files = " ".join(q(os.path.join(wd, f"c{i:05d}{ext}")) for i in range(len(chunks)))
-            ok, err = await self._sh(jid, f"cat {files} > {q(video + '.part')} && mv -f {q(video + '.part')} {q(video)}")
+            size = sum(os.path.getsize(os.path.join(wd, f"c{i:05d}{ext}")) for i in range(len(chunks)))
+            ok, err = await self._sh(jid, f"cat {files} > {q(video + '.part')} && mv -f {q(video + '.part')} {q(video)}",
+                                     read_total=size)
             if not ok:
-                return False if jid in self.cancelled else self._fail(f"joining chunks failed: {err[-300:]}")
+                return False if jid in self.cancelled else self._fail(f"joining chunks failed: {err_summary(err)}")
             state["joined"] = True
             self._save_state(wd, state)
             for i in range(len(chunks)):
@@ -1055,35 +1157,35 @@ class Worker:
         if frames != expected:      # a misplaced chunk join would add or lose a frame there (audio drifts)
             plan["frame_problem"] = f"frame count changed ({expected} → {frames})"
         if plan.get("dv_convert") and not state.get("dv_converted"):
-            db.x("UPDATE jobs SET message=? WHERE id=?", ("converting Dolby Vision metadata to profile 8.1", jid))
-            ok, err = await self._sh(jid, f"dovi_tool -m 2 convert -i {q(video)} -o {q(video + '.dv')} && "
-                                          f"mv -f {q(video + '.dv')} {q(video)}")
-            if not ok:
-                return False if jid in self.cancelled else self._fail(f"Dolby Vision conversion failed: {err[-400:]}")
+            if not await self._dv_from_source(jid, path, video, wd, frames):
+                return False
             state["dv_converted"] = True
             self._save_state(wd, state)
         js = plan.get("hdr10plus_json")
         if js and not state.get("injected"):
-            db.x("UPDATE jobs SET message=? WHERE id=?", ("injecting HDR10+ metadata", jid))
+            self._enter(jid, "HDR10+ metadata", "adding the HDR10+ metadata to the new video")
             ok, err = await self._sh(jid, f"hdr10plus_tool inject -i {q(video)} -j {q(js)} -o {q(video + '.inj')} && "
-                                          f"mv -f {q(video + '.inj')} {q(video)}")
+                                          f"mv -f {q(video + '.inj')} {q(video)}", read_total=os.path.getsize(video))
             if not ok:
-                return False if jid in self.cancelled else self._fail(f"HDR10+ injection failed: {err[-400:]}")
+                return False if jid in self.cancelled else self._fail(f"HDR10+ injection failed: {err_summary(err)}")
             state["injected"] = True
             self._save_state(wd, state)
-        db.x("UPDATE jobs SET message=? WHERE id=?", ("adding audio, subtitles and chapters", jid))
+        self._enter(jid, "Audio and subtitles", "copying the audio, subtitles and chapters from the original")
         side = os.path.join(wd, "streams.mkv")
         stamp = f"{codec}/software/q{crf} {dt.date.today().isoformat()}"
-        ok, err = await self._sh(jid, " ".join(q(a) for a in streams_command(path, side, s, stamp)))
+        ok, err = await self._sh(jid, " ".join(q(a) for a in streams_command(path, side, s, stamp)),
+                                 read_total=os.path.getsize(path))
         if not ok:
-            return False if jid in self.cancelled else self._fail(f"copying audio/subtitles failed: {err[-400:]}")
+            return False if jid in self.cancelled else self._fail(f"copying audio/subtitles failed: {err_summary(err)}")
         fr = s.get("fps_rational") or f"{fps}"
+        self._enter(jid, "Final file", "putting the new video, audio and subtitles together")
         ok, err = await self._sh(jid, f"mkvmerge -q -o {q(plan['tmp'])} --default-duration 0:{fr}fps {q(video)} "
-                                      f"{q(side)}; rc=$?; [ $rc -le 1 ]")
+                                      f"{q(side)}; rc=$?; [ $rc -le 1 ]",
+                                 read_total=os.path.getsize(video) + os.path.getsize(side))
         if not ok:
             if os.path.exists(plan["tmp"]):
                 os.unlink(plan["tmp"])
-            return False if jid in self.cancelled else self._fail(f"final mux failed: {err[-400:]}")
+            return False if jid in self.cancelled else self._fail(f"final mux failed: {err_summary(err)}")
         return True
 
     @staticmethod
@@ -1116,8 +1218,9 @@ class Worker:
                 os.unlink(path)
         return final
 
-    async def _sh(self, jid: int, script: str) -> tuple[bool, str]:
-        """Run a shell pipeline in its own process group (so cancel/pause reach every stage)."""
+    async def _sh(self, jid: int, script: str, read_total: int | None = None) -> tuple[bool, str]:
+        """Run a shell pipeline in its own process group (so cancel/pause reach every stage). read_total: bytes the
+        step reads (a whole source file, say), so its progress can be shown."""
         await self.gate(jid)
         proc = await asyncio.create_subprocess_exec(*_priority_prefix(), "/bin/bash", "-c",
                                                     "set -o pipefail 2>/dev/null; " + script,
@@ -1126,12 +1229,16 @@ class Worker:
         self.procs[jid] = proc
         if self.frozen(jid):
             self._signal(jid, signal.SIGSTOP)
+        watch = asyncio.create_task(self._watch_reads(jid, proc.pid, read_total)) if read_total else None
         try:
             out, err = await proc.communicate()
         except BaseException:
             if proc.returncode is None:
                 os.killpg(proc.pid, signal.SIGKILL)
             raise
+        finally:
+            if watch:
+                watch.cancel()
         if jid in self.cancelled:
             return False, "cancelled"
         msg = (err or out or b"").decode(errors="ignore")
@@ -1139,33 +1246,89 @@ class Worker:
             msg = "a step was killed (signal 9) — usually the system running out of memory; " + msg[-300:]
         return proc.returncode == 0, msg
 
-    async def _postprocess_hevc(self, jid: int, plan: dict, s: dict):
-        """Single-pass encodes: pull the HEVC stream out, convert DV to 8.1 and/or inject HDR10+, remux."""
+    async def _postprocess_hevc(self, jid: int, path: str, plan: dict, s: dict):
+        """Single-pass encodes: pull the HEVC stream out, add Dolby Vision (from the source) and/or HDR10+, remux."""
         tmp, wd, js = plan["tmp"], plan["workdir"], plan.get("hdr10plus_json")
         cur, out = os.path.join(wd, "enc.hevc"), os.path.join(wd, "remux.mkv")
         q = shlex.quote
         fps = s.get("fps_rational") or "24000/1001"
-        steps = [("extracting the video stream",
-                  f"{q(probe.FFMPEG)} -nostdin -v error -y -i {q(tmp)} -map 0:V:0 -c copy -bsf:v hevc_mp4toannexb "
-                  f"-f hevc {q(cur)}")]
-        if plan.get("dv_convert"):
-            steps.append(("converting Dolby Vision metadata to profile 8.1",
-                          f"dovi_tool -m 2 convert -i {q(cur)} -o {q(cur + '.x')} && mv -f {q(cur + '.x')} {q(cur)}"))
-        if js:
-            steps.append(("injecting HDR10+ metadata",
-                          f"hdr10plus_tool inject -i {q(cur)} -j {q(js)} -o {q(cur + '.x')} && mv -f {q(cur + '.x')} {q(cur)}"))
-        steps += [("remuxing", f"mkvmerge -q -o {q(out)} --default-duration 0:{fps}fps {q(cur)} -D {q(tmp)}; "
-                               f"rc=$?; [ $rc -le 1 ]"),
-                  ("remuxing", f"mv -f {q(out)} {q(tmp)} && rm -f {q(cur)}")]
-        for label, st in steps:
-            db.x("UPDATE jobs SET message=? WHERE id=?", (label, jid))
-            ok, err = await self._sh(jid, st)
+
+        async def step(name: str, detail: str, script: str, read_total: int | None = None) -> bool:
+            self._enter(jid, name, detail)
+            ok, err = await self._sh(jid, script, read_total=read_total)
             if not ok:
                 if jid in self.cancelled:
-                    return
+                    return False
                 if os.path.exists(tmp):
                     os.unlink(tmp)
-                raise RuntimeError(f"{label} failed: {err[-400:]}")
+                raise RuntimeError(f"{detail} failed: {err_summary(err)}")
+            return True
+
+        if not await step("Preparing the video stream", "taking the video stream out of the new file",
+                          f"{q(probe.FFMPEG)} -nostdin -v error -y -i {q(tmp)} -map 0:V:0 -c copy -bsf:v hevc_mp4toannexb "
+                          f"-f hevc {q(cur)}", os.path.getsize(tmp)):
+            return
+        if plan.get("dv_convert"):
+            if not await self._dv_from_source(jid, path, cur, wd, None):
+                if os.path.exists(tmp) and jid not in self.cancelled:
+                    os.unlink(tmp)
+                return
+        if js and not await step("HDR10+ metadata", "adding the HDR10+ metadata to the new video",
+                                 f"hdr10plus_tool inject -i {q(cur)} -j {q(js)} -o {q(cur + '.x')} && "
+                                 f"mv -f {q(cur + '.x')} {q(cur)}", os.path.getsize(cur)):
+            return
+        if not await step("Final file", "putting the new video, audio and subtitles together",
+                          f"mkvmerge -q -o {q(out)} --default-duration 0:{fps}fps {q(cur)} -D {q(tmp)}; rc=$?; [ $rc -le 1 ]",
+                          os.path.getsize(cur) + os.path.getsize(tmp)):
+            return
+        ok, err = await self._sh(jid, f"mv -f {q(out)} {q(tmp)} && rm -f {q(cur)}")
+        if not ok and jid not in self.cancelled:
+            raise RuntimeError(f"remuxing failed: {err_summary(err)}")
+
+    async def _dv_from_source(self, jid: int, src: str, video: str, wd: str, frames: int | None) -> bool:
+        """Dolby Vision for a finished HEVC stream: the source's RPUs, converted to profile 8.1 by dovi_tool (mode 2),
+        injected frame for frame. Taking them from the source works for every disc layout, including ones whose
+        RPUs ffmpeg can't hand to x265. A source cut mid-GOP has RPUs for frames that can't be decoded at its start:
+        those are dropped. Any other mismatch fails the job (the original is kept)."""
+        q = shlex.quote
+        rpu = os.path.join(wd, "rpu.bin")
+        if not os.path.exists(rpu):
+            self._enter(jid, "Dolby Vision metadata", "reading the Dolby Vision metadata from the original")
+            ok, err = await self._sh(jid, f"dovi_tool -m 2 extract-rpu -i {q(src)} -o {q(rpu + '.part')} && "
+                                          f"mv -f {q(rpu + '.part')} {q(rpu)}", read_total=os.path.getsize(src))
+            if not ok:
+                return False if jid in self.cancelled else self._fail(f"reading the Dolby Vision metadata failed: {err_summary(err)}")
+        else:
+            self._enter(jid, "Dolby Vision metadata", "using the Dolby Vision metadata read earlier")
+        if frames is None:      # single pass: count the new stream's frames
+            cnt = os.path.join(wd, "enc-frames.txt")
+            ok, err = await self._sh(jid, f"{q(probe.FFPROBE)} -v error -select_streams V:0 -count_packets "
+                                          f"-show_entries stream=nb_read_packets -of csv=p=0 {q(video)} > {q(cnt)}",
+                                     read_total=os.path.getsize(video))
+            try:
+                frames = int(open(cnt).read().strip().strip(",").split()[0])
+            except (OSError, ValueError, IndexError):
+                return False if jid in self.cancelled else self._fail(f"couldn't count the new video's frames: {err_summary(err)}")
+        ok, out = await self._sh(jid, f"dovi_tool info -i {q(rpu)} -s")
+        m = re.search(r"Frames:\s*(\d+)", out or "")
+        if not ok or not m:
+            return False if jid in self.cancelled else self._fail(f"couldn't read the Dolby Vision metadata: {err_summary(out)}")
+        extra = int(m.group(1)) - frames
+        if extra < 0:
+            return self._fail(f"the Dolby Vision metadata covers {m.group(1)} frames but the video has {frames}")
+        use = rpu
+        if extra:
+            json.dump({"remove": [f"0-{extra - 1}"]}, open(os.path.join(wd, "rpu-edit.json"), "w"))
+            use = os.path.join(wd, "rpu-trimmed.bin")
+            ok, err = await self._sh(jid, f"dovi_tool editor -i {q(rpu)} -j {q(os.path.join(wd, 'rpu-edit.json'))} -o {q(use)}")
+            if not ok:
+                return False if jid in self.cancelled else self._fail(f"trimming the Dolby Vision metadata failed: {err_summary(err)}")
+        self._detail(jid, "adding the Dolby Vision metadata (profile 8.1) to the new video")
+        ok, err = await self._sh(jid, f"dovi_tool inject-rpu -i {q(video)} --rpu-in {q(use)} -o {q(video + '.dv')} && "
+                                      f"mv -f {q(video + '.dv')} {q(video)}", read_total=os.path.getsize(video))
+        if not ok:
+            return False if jid in self.cancelled else self._fail(f"adding the Dolby Vision metadata failed: {err_summary(err)}")
+        return True
 
     async def _crf_search(self, jid: int, path: str, s: dict, plan: dict) -> tuple[int, float, dict]:
         """Find the highest CRF whose sample encodes still reach the VMAF target (binary search)."""
@@ -1177,17 +1340,20 @@ class Worker:
         points = [dur * (i + 1) / (n + 1) for i in range(n)] if dur > 60 else [0]
         samples = []
         for i, t in enumerate(points):
+            self._detail(jid, f"cutting sample clip {i + 1} of {len(points)}", 0.0)
             sp = os.path.join(wd, f"ref{i}.mkv")
             ok, err = await self._sh(jid, f"{shlex.quote(probe.FFMPEG)} -nostdin -v error -y -ss {t:.2f} "
                                           f"-i {shlex.quote(path)} -t {seg} -map 0:V:0 -c copy {shlex.quote(sp)}")
             if not ok:
-                raise RuntimeError(f"sample extraction failed: {err[-300:]}")
+                raise RuntimeError(f"sample extraction failed: {err_summary(err)}")
             samples.append(sp)
         model = "vmaf_4k_v0.6.1" if s.get("height", 0) >= 1800 else "vmaf_v0.6.1"
         threads = limits()["cpus"]
         enc = _software_args(codec, 10, 0, s, full=False)
         tried: dict[int, float] = {}
         ff = shlex.quote(probe.FFMPEG)
+        lo0, hi0 = crf_range(codec, s)
+        tests = max(1, math.ceil(math.log2(hi0 - lo0 + 2)))      # a binary search over the CRF range
 
         async def score(crf: int) -> float:
             if crf in tried:
@@ -1195,13 +1361,16 @@ class Worker:
             args = list(enc)
             args[args.index("-crf") + 1] = str(crf)
             vals = []
+            done = len(tried)
             for i, sp in enumerate(samples):
+                self._detail(jid, f"testing CRF {crf} (test {done + 1} of about {tests}) — sample {i + 1} of {len(samples)}",
+                             min(0.99, (done + i / len(samples)) / tests))
                 dist = os.path.join(wd, f"dist{i}.mkv")
                 ok, err = await self._sh(jid, f"{ff} -nostdin -v error -y -i {shlex.quote(sp)} "
                                               f"{' '.join(shlex.quote(a) for a in args)} -fps_mode passthrough "
                                               f"{shlex.quote(dist)}")
                 if not ok:
-                    raise RuntimeError(f"sample encode failed at CRF {crf}: {err[-300:]}")
+                    raise RuntimeError(f"sample encode failed at CRF {crf}: {err_summary(err)}")
                 r, d, js = (os.path.join(wd, x) for x in ("r.y4m", "d.y4m", "vmaf.json"))
                 for fifo in (r, d):
                     if os.path.exists(fifo):
@@ -1215,14 +1384,13 @@ class Worker:
                     f"vmaf -q -r {shlex.quote(r)} -d {shlex.quote(d)} --threads {threads} "
                     f"--model version={model} --json -o {shlex.quote(js)}; rc=$?; kill $(jobs -p) 2>/dev/null; wait; exit $rc")
                 if not ok:
-                    raise RuntimeError(f"VMAF failed at CRF {crf}: {err[-300:]}")
+                    raise RuntimeError(f"VMAF failed at CRF {crf}: {err_summary(err)}")
                 with open(js) as f:
                     vals.append(float(json.load(f)["pooled_metrics"]["vmaf"]["mean"]))
             # the weakest sample decides: dark/grainy scenes must also look right
             sc = min(sum(vals) / len(vals), min(vals) + 1.0)
             tried[crf] = round(sc, 2)
-            db.x("UPDATE jobs SET message=? WHERE id=?",
-                 (f"quality search: CRF {crf} → VMAF {sc:.1f} (target {target:g})", jid))
+            self._detail(jid, f"CRF {crf} → VMAF {sc:.1f} (target {target:g})", min(0.99, len(tried) / tests))
             return sc
 
         lo, hi = crf_range(codec, s)
@@ -1316,7 +1484,7 @@ class Worker:
         if rc < 0:
             err = (f"the encoder was killed by signal {-rc}"
                    + (" — usually the system running out of memory" if -rc == signal.SIGKILL else "")
-                   + (f"; last output: {err[-300:]}" if err else ""))
+                   + (f"; last output: {err_summary(err)}" if err else ""))
         return rc == 0, err or f"exit code {rc}"
 
 
@@ -1367,6 +1535,22 @@ def sweep_workdirs(roots: list[str], now: float | None = None) -> tuple[int, int
                     keep.append(d)
             dirnames[:] = keep
     return n, freed
+
+
+ERROR_WORDS = re.compile(r"error|invalid|fail|unsupported|denied|no such|not found|mismatch|cannot|unable", re.I)
+
+
+def err_summary(err: str, limit: int = 700) -> str:
+    """The useful part of a tool's error output: its error lines first (whole lines, never cut mid-word), then
+    the last lines for context. A plain tail cut the real reason in half ("...ETADATA")."""
+    lines = [l.rstrip() for l in (err or "").splitlines() if l.strip()]
+    key = [l for l in lines if ERROR_WORDS.search(l)]
+    out = []
+    for l in key[:6] + [l for l in lines[-3:] if l not in key]:
+        if sum(len(x) + 1 for x in out) + len(l) > limit:
+            break
+        out.append(l)
+    return "\n".join(out) or (err or "")[-limit:]
 
 
 def expected_output(s: dict, codec: str, orig_size: int) -> int:

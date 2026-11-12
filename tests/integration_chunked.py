@@ -163,6 +163,26 @@ async def main():
         check("dv: HDR10 light levels kept", o["cll"] == sd["cll"] and sd["cll"] != [0, 0],
               f"source cll={sd['cll']} output cll={o['cll']}")
 
+    # 2b') Dolby Vision metadata for more frames than were encoded (a source cut mid-GOP has RPUs for leading
+    # packets that can't be decoded): the extra entries at the start are dropped, so every frame gets its own RPU.
+    wd = "/tmp/dvtrim"
+    os.makedirs(wd, exist_ok=True)
+    sh(f"{FF} -v error -y -i {src} -map 0:v -c copy -bsf:v hevc_mp4toannexb -f hevc {wd}/plain.hevc")
+    sh(f"dovi_tool remove -i {wd}/plain.hevc -o {wd}/video.hevc")          # no RPUs, like a fresh x265 encode
+    json.dump({"cm_version": "V40", "length": n + 3}, open(f"{wd}/g.json", "w"))
+    sh(f"dovi_tool generate -j {wd}/g.json -o {wd}/rpu.bin")                # stands in for the source's RPUs
+    ok = await transcode.worker._dv_from_source(99, src, f"{wd}/video.hevc", wd, n)
+    rp = subprocess.run(["sh", "-c", f"dovi_tool extract-rpu -i {wd}/video.hevc -o {wd}/out.bin >/dev/null 2>&1; "
+                         f"dovi_tool info -i {wd}/out.bin -s"], capture_output=True, text=True).stdout
+    check("dv: 3 extra leading RPUs trimmed, one RPU per frame", ok and f"Frames: {n}" in rp,
+          (rp.strip().splitlines() or ["no RPU"])[min(2, len(rp.strip().splitlines()) - 1)] if rp.strip() else "no RPU")
+    try:
+        sh(f"rm -f {wd}/rpu*.bin {wd}/rpu-edit.json; dovi_tool generate -j {wd}/g.json -o {wd}/rpu.bin")
+        await transcode.worker._dv_from_source(99, src, f"{wd}/video.hevc", wd, n + 10)
+        check("dv: too little metadata is refused", False, "no error")
+    except RuntimeError as e:
+        check("dv: too little metadata is refused", "covers" in str(e), str(e))
+
     # 2c) light levels only in the Matroska container (zeros in the stream), as on many disc remuxes
     config.update({"target_codec": "hevc"})
     sh(f"{FF} -v error -y -f lavfi -i testsrc2=s=640x360:r=24000/1001:d=6 -c:v libx265 -preset ultrafast "

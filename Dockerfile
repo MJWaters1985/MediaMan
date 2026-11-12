@@ -57,6 +57,8 @@ COPY app ./app
 
 EXPOSE 8765
 # start-interval: check every 3s right after start so TrueNAS leaves "Deploying" quickly
+# The TrueNAS catalog app checks health with its own curl test of /healthz, so curl must stay in the image.
+# This HEALTHCHECK covers YAML installs and plain docker run.
 HEALTHCHECK --interval=60s --timeout=5s --start-period=60s --start-interval=3s CMD ["python", "-m", "app.healthcheck"]
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "-m", "app.server"]

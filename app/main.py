@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth, config, db, fsbrowse, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="MediaMan", version=VERSION)
@@ -117,6 +117,7 @@ def status():
     return {
         "version": VERSION,
         "hardware": transcode.hw,
+        "resources": transcode.resource_advice(),
         "target_codec": transcode.target_codec(),
         "scan": organizer.scan_state,
         "watcher": {**watcher.state, "enabled": config.get("watcher_enabled")},
@@ -327,6 +328,7 @@ def list_jobs(status: str = "", limit: int = 300):
     for r in rows:
         p = db.jload(r["plan"]) or {}
         r["backend"], r["codec"], r["reason"] = p.get("backend"), p.get("codec"), p.get("reason")
+        r["stage"] = transcode.worker.stage_view(r["id"]) if r["status"] in ("running", "paused") else None
         r.pop("plan")
     return rows
 

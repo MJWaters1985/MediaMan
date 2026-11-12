@@ -62,7 +62,7 @@ def test_software_args_keep_hdr():
     j = " ".join(a)
     assert "libsvtav1" in j and "yuv420p10le" in j and "content-light=1000,400" in j and "-dolbyvision 0" in j
     h = " ".join(transcode._software_args("hevc", 10, 20, S(**UHD, dovi=True, dv_profile=7, vbitrate=88_000_000)))
-    assert "libx265" in h and "hdr10=1" in h and "vbv-maxrate=88000" in h and "-dolbyvision 1" in h and "main10" in h
+    assert "libx265" in h and "hdr10=1" in h and "vbv-maxrate=88000" in h and "-dolbyvision 0" in h and "main10" in h
     sample = " ".join(transcode._software_args("hevc", 10, 20, S(**UHD, dovi=True), full=False))
     assert "-dolbyvision 0" in sample and "vbv" not in sample
 
@@ -305,3 +305,53 @@ def test_existing_installs_skip_the_setup_wizard(tmp_path, monkeypatch):
     assert s["setup_done"] is True and s["movies_dir"] == "/data/Media/Movies"
     assert s["tv_dir"] == "/media/tv" and s["downloads_dir"] == "/downloads"     # old defaults kept
     monkeypatch.setattr(config, "_settings", None)
+
+
+def test_error_summary_keeps_the_reason():
+    """The real error line comes first and whole, instead of a tail cut mid-word."""
+    err = ("x265 [warning]: something harmless\n" + "noise line\n" * 30 +
+           "[libx265] Error encoding a frame: Invalid data found when processing input\n"
+           "[vost#0:0/libx265] Terminating thread with return code -1094995529\n")
+    s = transcode.err_summary(err)
+    assert s.startswith("[libx265] Error encoding a frame: Invalid data found when processing input")
+    assert s.count("noise line") <= 1 and len(s) <= 700     # at most one line of trailing context
+    assert transcode.err_summary("just a tail") == "just a tail"
+
+
+def test_job_steps_are_reported():
+    import asyncio
+    w = transcode.Worker()
+    w._steps(7, ["Quality search", "Encoding", "Checking the result"])
+    w._enter(7, "Encoding", "chunk 1 of 3")
+    v = w.stage_view(7)
+    assert (v["name"], v["step"], v["of"], v["detail"]) == ("Encoding", 2, 3, "chunk 1 of 3")
+    w._detail(7, "chunk 2 of 3", 0.5)
+    assert w.stage_view(7)["progress"] == 0.5
+
+    async def watched():                  # a step that reads a file reports how much it has read
+        import tempfile
+        f = tempfile.NamedTemporaryFile(delete=False)
+        f.write(os.urandom(8 * 1024 * 1024))
+        f.close()
+        w._enter(7, "Final file")
+        ok, _ = await w._sh(7, f"cat {f.name} > /dev/null; sleep 3", read_total=8 * 1024 * 1024)
+        return ok, w.stage_view(7)["progress"]
+    ok, progress = asyncio.run(watched())
+    assert ok and progress and progress > 0.9
+
+
+def test_resource_advice_explains_low_limits(monkeypatch):
+    from app import transcode
+    gb = 1024 ** 3
+    monkeypatch.setattr(transcode.config, "get", lambda k, d=None: 1 if k == "concurrent_jobs" else d)
+    monkeypatch.setattr(transcode, "limits", lambda: {"cpus": 2, "memory": 4 * gb})
+    r = transcode.resource_advice()
+    assert any("Only 2 CPUs" in w for w in r["warnings"]) and any("Only 4 GB memory" in w for w in r["warnings"])
+    assert "Resources Configuration" in r["hint"]
+    monkeypatch.setattr(transcode, "limits", lambda: {"cpus": 16, "memory": 8 * gb})
+    r = transcode.resource_advice()
+    assert r["av1_4k_level"] < r["av1_4k_level_max"] == 4
+    assert any("About 13 GB" in w for w in r["warnings"])
+    monkeypatch.setattr(transcode, "limits", lambda: {"cpus": 16, "memory": 64 * gb})
+    r = transcode.resource_advice()
+    assert r["warnings"] == [] and r["hint"] == ""
