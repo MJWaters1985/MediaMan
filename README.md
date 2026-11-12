@@ -246,6 +246,13 @@ import is running, checks the new pair loads, and restarts itself onto it. If th
 missing or don't load at startup, it falls back to plain HTTP and shows the reason on the
 Overview tab, so a bad path can't lock you out.
 
+**Connecting to Jellyfin over HTTPS:** MediaMan checks Jellyfin's certificate (Settings → *Verify
+Jellyfin TLS*; turn it off only for a self-signed certificate). Jellyfin often sends just its own
+certificate without the intermediate that links it to a trusted root, which browsers fill in by
+themselves. MediaMan does the same: it fetches the missing certificates from the address written in
+Jellyfin's certificate, keeps them in the config folder, and still requires the chain to end at a
+trusted root.
+
 ### Permissions
 
 The container runs as `568:568` (TrueNAS's `apps` user, the same user the Jellyfin and qBittorrent

@@ -15,6 +15,14 @@ All notable changes to MediaMan. Versions follow [semantic versioning](https://s
   full list of steps. Steps that read a big file (joining the chunks, adding metadata, writing the final
   file, the final check) also show how much has been read, the read speed and the time left.
 - Error messages lead with the tool's actual error line instead of a cut-off tail.
+- Fixed: calls to a Jellyfin server that doesn't send its intermediate certificate (common when Jellyfin
+  serves a .pfx) failed with *unable to get local issuer certificate*, so lookups and library updates
+  stopped. MediaMan now fetches the missing certificates from the address in the server's certificate, as
+  browsers do, and keeps them in /config. The chain must still end at a trusted root. A check that still
+  fails is explained in plain words.
+- qBittorrent connection blips (a slow TLS handshake, a DNS hiccup) are no longer logged: the next poll
+  retries, and only a problem lasting 3 minutes is logged, with a note when it's reachable again. A
+  rejected login is still logged at once. Connections get 20 seconds instead of 10.
 - Overview and the Transcode queue warn when the app's CPU or memory limits are too low for 4K transcodes,
   say how much to give it, and point to where TrueNAS sets them (*Apps → MediaMan → Edit → Resources
   Configuration*).

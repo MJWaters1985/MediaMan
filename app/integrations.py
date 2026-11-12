@@ -8,7 +8,7 @@ import time
 
 import httpx
 
-from . import config, db
+from . import config, db, tlschain
 from .identify import COUNTRY_SUFFIX, norm
 
 def lookups_enabled() -> bool:
@@ -26,16 +26,16 @@ def _jf_search(kind: str, name: str, year: int | None, ids: dict) -> list[dict] 
     if row and time.time() - row["ts"] < 30 * 86400:
         return db.jload(row["data"])
     try:
-        r = httpx.post(_jf_url() + f"/Items/RemoteSearch/{kind}", headers=_jf_headers(), timeout=30,
-                       json={"SearchInfo": info, "IncludeDisabledProviders": True},
-                       verify=config.get("jellyfin_verify_tls"))
+        r = tlschain.request("POST", _jf_url() + f"/Items/RemoteSearch/{kind}", headers=_jf_headers(), timeout=30,
+                             json={"SearchInfo": info, "IncludeDisabledProviders": True},
+                             enabled=config.get("jellyfin_verify_tls"))
         if r.status_code >= 400:
             db.log("warn", "lookup", f"Jellyfin search failed for {name!r}: {_jf_explain(r)}")
             return None
         data = [{"id": str(x["ProviderIds"]["Tmdb"]), "title": x.get("Name") or "", "year": x.get("ProductionYear")}
                 for x in r.json() if (x.get("ProviderIds") or {}).get("Tmdb")]
     except Exception as e:
-        db.log("warn", "lookup", f"Jellyfin search failed for {name!r}: {e}")
+        db.log("warn", "lookup", f"Jellyfin search failed for {name!r}: {tlschain.explain(e)}")
         return None
     db.x("INSERT OR REPLACE INTO tmdb_cache(q,data,ts) VALUES(?,?,?)", (cache_key, json.dumps(data), time.time()))
     return data
@@ -118,15 +118,15 @@ def jellyfin_refresh() -> bool:
     if not url or not key:
         return False
     try:
-        r = httpx.post(url + "/Library/Refresh", headers=_jf_headers(), timeout=15,
-                       verify=config.get("jellyfin_verify_tls"))
+        r = tlschain.request("POST", url + "/Library/Refresh", headers=_jf_headers(), timeout=15,
+                             enabled=config.get("jellyfin_verify_tls"))
         if r.status_code >= 400:
             db.log("warn", "jellyfin", f"refresh failed: {_jf_explain(r)}")
             return False
         db.log("info", "jellyfin", "library refresh requested")
         return True
     except Exception as e:
-        db.log("warn", "jellyfin", f"refresh failed: {e}")
+        db.log("warn", "jellyfin", f"refresh failed: {tlschain.explain(e)}")
         return False
 
 
@@ -150,8 +150,8 @@ def _jf_locations() -> list[str]:
     """Jellyfin's own library folders (its paths can differ from MediaMan's: other container, other mounts)."""
     if time.time() - _folders["ts"] < 600:
         return _folders["locations"]
-    r = httpx.get(_jf_url() + "/Library/VirtualFolders", headers=_jf_headers(), timeout=15,
-                  verify=config.get("jellyfin_verify_tls"))
+    r = tlschain.request("GET", _jf_url() + "/Library/VirtualFolders", headers=_jf_headers(), timeout=15,
+                         enabled=config.get("jellyfin_verify_tls"))
     r.raise_for_status()
     locs = [loc for f in r.json() for loc in (f.get("Locations") or [])]
     _folders.update(ts=time.time(), locations=locs)
@@ -203,15 +203,15 @@ def jellyfin_flush() -> bool:
                                            f"whole library instead")
                 return jellyfin_refresh()
             updates.append({"Path": jp, "UpdateType": kind})
-        r = httpx.post(url + "/Library/Media/Updated", headers=_jf_headers(), json={"Updates": updates}, timeout=15,
-                       verify=config.get("jellyfin_verify_tls"))
+        r = tlschain.request("POST", url + "/Library/Media/Updated", headers=_jf_headers(), json={"Updates": updates},
+                             timeout=15, enabled=config.get("jellyfin_verify_tls"))
         if r.status_code >= 400:
             db.log("warn", "jellyfin", f"update failed: {_jf_explain(r)} — refreshing the whole library instead")
             return jellyfin_refresh()
         db.log("info", "jellyfin", f"told Jellyfin about {len(updates)} changed file{'s' if len(updates) != 1 else ''}")
         return True
     except Exception as e:
-        db.log("warn", "jellyfin", f"update failed: {e} — refreshing the whole library instead")
+        db.log("warn", "jellyfin", f"update failed: {tlschain.explain(e)} — refreshing the whole library instead")
         return jellyfin_refresh()
 
 
@@ -220,26 +220,30 @@ def jellyfin_test() -> str:
     if not url or not key:
         return "not configured"
     try:
-        pub = httpx.get(url + "/System/Info/Public", timeout=10, verify=config.get("jellyfin_verify_tls"))
+        pub = tlschain.request("GET", url + "/System/Info/Public", timeout=10, enabled=config.get("jellyfin_verify_tls"))
         pub.raise_for_status()
-        r = httpx.get(url + "/System/Info", headers=_jf_headers(), timeout=10, verify=config.get("jellyfin_verify_tls"))
+        r = tlschain.request("GET", url + "/System/Info", headers=_jf_headers(), timeout=10,
+                             enabled=config.get("jellyfin_verify_tls"))
         if r.status_code >= 400:
             return f"reached {pub.json().get('ServerName')} (Jellyfin {pub.json().get('Version')}) but {_jf_explain(r)}"
         j = r.json()
         return f"ok — {j.get('ServerName')} {j.get('Version')}"
     except Exception as e:
-        return f"failed: {e}"
+        return f"failed: {tlschain.explain(e)}"
 
 
 # ---------------------------------------------------------------- qBittorrent
-qbit_state = {"error": None}
+qbit_state = {"error": None, "failing_since": None, "warned": False}
+# a single failed poll (a slow TLS handshake, a DNS hiccup) is retried 30 s later; only a problem that lasts this
+# long is logged
+QBIT_GRACE_SECONDS = 180
 
 
 def _qbit_client() -> tuple[httpx.Client, str]:
     url = config.get("qbittorrent_url").strip().rstrip("/")
     if not url.startswith(("http://", "https://")):
         url = "http://" + url
-    c = httpx.Client(timeout=10, verify=False, headers={"Referer": url, "Origin": url})
+    c = httpx.Client(timeout=httpx.Timeout(20, connect=20), verify=False, headers={"Referer": url, "Origin": url})
     if config.get("qbittorrent_username"):
         r = c.post(url + "/api/v2/auth/login", data={
             "username": config.get("qbittorrent_username"), "password": config.get("qbittorrent_password")})
@@ -268,16 +272,29 @@ def qbit_completed_names() -> set[str] | None:
         try:
             r = c.get(url + "/api/v2/torrents/info")
             r.raise_for_status()
-            qbit_state["error"] = None
-            return {t["name"] for t in r.json() if t.get("progress", 0) >= 1.0}
+            names = {t["name"] for t in r.json() if t.get("progress", 0) >= 1.0}
         finally:
             c.close()
     except Exception as e:
-        msg = str(e) if isinstance(e, PermissionError) else f"unreachable: {e}"
-        if qbit_state["error"] != msg:      # log each distinct problem once, not every poll
-            db.log("warn", "qbittorrent", msg)
-        qbit_state["error"] = msg
+        _qbit_failed(str(e) if isinstance(e, PermissionError) else f"unreachable: {e}", isinstance(e, PermissionError))
         return None
+    if qbit_state["warned"]:
+        mins = (time.time() - qbit_state["failing_since"]) / 60
+        db.log("info", "qbittorrent", f"reachable again (after {mins:.0f} min)")
+    qbit_state.update(error=None, failing_since=None, warned=False)
+    return names
+
+
+def _qbit_failed(msg: str, permanent: bool) -> None:
+    """Log a qBittorrent problem once: a rejected login at once, a connection problem only once it has lasted
+    QBIT_GRACE_SECONDS (each poll in between is simply retried)."""
+    now = time.time()
+    since = qbit_state["failing_since"] = qbit_state["failing_since"] or now
+    if permanent or now - since >= QBIT_GRACE_SECONDS:
+        if not qbit_state["warned"] or qbit_state["error"] != msg:
+            db.log("warn", "qbittorrent", msg if permanent else f"{msg} (for {(now - since) / 60:.0f} min)")
+        qbit_state["warned"] = True
+    qbit_state["error"] = msg
 
 
 def qbit_test() -> str:

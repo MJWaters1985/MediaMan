@@ -209,3 +209,25 @@ def test_jellyfin_told_only_about_changed_files(tmp_path):
         assert FakeJellyfinLibrary.posts[-1][0] == "/Library/Refresh"
     finally:
         srv.shutdown()
+
+
+def test_qbit_blips_are_not_logged_but_lasting_outages_are(monkeypatch):
+    from app import db
+    logged = []
+    monkeypatch.setattr(db, "log", lambda level, area, msg: logged.append((level, msg)))
+    clock = [1000.0]
+    monkeypatch.setattr(integrations.time, "time", lambda: clock[0])
+    integrations.qbit_state.update(error=None, failing_since=None, warned=False)
+    integrations._qbit_failed("unreachable: handshake timed out", False)      # one slow poll
+    assert logged == [] and integrations.qbit_state["error"]
+    clock[0] += 30
+    integrations._qbit_failed("unreachable: handshake timed out", False)
+    assert logged == []
+    clock[0] += integrations.QBIT_GRACE_SECONDS
+    integrations._qbit_failed("unreachable: handshake timed out", False)      # still down after the grace period
+    assert len(logged) == 1 and "for 4 min" in logged[0][1]
+    integrations._qbit_failed("unreachable: handshake timed out", False)      # logged once, not every poll
+    assert len(logged) == 1
+    integrations.qbit_state.update(error=None, failing_since=None, warned=False)
+    integrations._qbit_failed("username or password rejected by qBittorrent", True)   # a rejected login: at once
+    assert len(logged) == 2 and "rejected" in logged[1][1]
