@@ -1312,6 +1312,7 @@ class Worker:
         else:
             self._enter(jid, "Dolby Vision metadata", "using the Dolby Vision metadata read earlier")
         if frames is None:      # single pass: count the new stream's frames
+            self._detail(jid, "counting the new video's frames")
             cnt = os.path.join(wd, "enc-frames.txt")
             ok, err = await self._sh(jid, f"{q(probe.FFPROBE)} -v error -select_streams V:0 -count_packets "
                                           f"-show_entries stream=nb_read_packets -of csv=p=0 {q(video)} > {q(cnt)}",
@@ -1320,6 +1321,7 @@ class Worker:
                 frames = int(open(cnt).read().strip().strip(",").split()[0])
             except (OSError, ValueError, IndexError):
                 return False if jid in self.cancelled else self._fail(f"couldn't count the new video's frames: {err_summary(err)}")
+        self._detail(jid, f"matching the metadata to the new video's {frames:,} frames")
         ok, out = await self._sh(jid, f"dovi_tool info -i {q(rpu)} -s")
         m = re.search(r"Frames:\s*(\d+)", out or "")
         if not ok or not m:
@@ -1331,6 +1333,8 @@ class Worker:
         if extra:
             json.dump({"remove": [f"0-{extra - 1}"]}, open(os.path.join(wd, "rpu-edit.json"), "w"))
             use = os.path.join(wd, "rpu-trimmed.bin")
+            self._detail(jid, f"dropping {extra} metadata entr{'y' if extra == 1 else 'ies'} for frames at the start "
+                              "that can't be decoded")
             ok, err = await self._sh(jid, f"dovi_tool editor -i {q(rpu)} -j {q(os.path.join(wd, 'rpu-edit.json'))} -o {q(use)}")
             if not ok:
                 return False if jid in self.cancelled else self._fail(f"trimming the Dolby Vision metadata failed: {err_summary(err)}")
