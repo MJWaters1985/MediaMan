@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth, config, db, fsbrowse, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="MediaMan", version=VERSION)
@@ -129,6 +129,7 @@ def status():
                                    "AND NOT EXISTS (SELECT 1 FROM transcode_skips k WHERE k.path=items.path AND k.size=items.size)") or {})["n"],
         "paths": paths,
         "tls": {k: v for k, v in tls.state.items() if k != "sig"},
+        "copies": organizer.copy_progress(),
         "ffmpeg": probe.FFMPEG,
         "auth": auth.state(),
     }

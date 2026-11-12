@@ -78,6 +78,7 @@ function renderOverview() {
     </div>
     <div class="card"><h3>Downloads watcher</h3>
       <div class="big">${imp.review || 0}</div><div class="muted">downloads need review</div>
+      ${(s.copies || []).map((c) => copyBar(c, true)).join("")}
       <div class="kv" style="margin-top:10px"><div>Status</div><div>${s.watcher?.enabled ? (s.watcher.error ? `<span style="color:var(--bad)">${esc(s.watcher.error)}</span>` : "watching") : "disabled"}</div>
       <div>Last check</div><div>${ago(s.watcher?.last_poll) || "—"}</div><div>Waiting</div><div>${imp.waiting || 0}</div><div>Imported</div><div>${imp.imported || 0}</div></div>
       <div class="toolbar" style="margin:12px 0 0"><button onclick="showTab('imports')">Open downloads</button></div>
@@ -246,17 +247,31 @@ async function detailsDialog(id) {
 let IMPORTS = [];
 const impItems = () => IMPORTS.flatMap((x) => x.items || []);
 $("#poll-now").onclick = () => act(() => api("/api/watcher/poll", { method: "POST" }), "Checking downloads folder…");
+function copyBar(c, compact) {
+  const pct = c.total ? (100 * c.done / c.total) : 0;
+  const what = c.mode === "move" ? "Moving" : "Copying";
+  const detail = `${fmtBytes(c.done)} of ${fmtBytes(c.total)} (${pct.toFixed(0)}%)` +
+    (c.speed ? ` · ${fmtBytes(c.speed)}/s` : c.done ? " · waiting for the disk" : "") + (c.eta != null ? ` · ${fmtDur(c.eta)} left` : "");
+  return `<div class="copy${compact ? " compact" : ""}"><div class="muted">${what} <b>${esc(c.name)}</b> into the library</div>
+    <div class="bar"><b style="width:${pct.toFixed(1)}%"></b></div><div class="meta">${detail}</div></div>`;
+}
+
 async function loadImports() {
   IMPORTS = await api("/api/imports");
+  const copies = STATUS.copies || [];
+  const dl = (SETTINGS.downloads_dir || "").replace(/\/$/, "");
+  const copiesFor = (imp) => copies.filter((c) => c.src === dl + "/" + imp.entry || c.src.startsWith(dl + "/" + imp.entry + "/"));
+  const other = copies.filter((c) => !IMPORTS.some((imp) => copiesFor(imp).includes(c)));
   const w = STATUS.watcher || {};
   $("#watch-state").innerHTML = w.enabled ? (w.error ? `<span style="color:var(--bad)">${esc(w.error)}</span>` : `Watching <span class="path">${esc(SETTINGS.downloads_dir)}</span> · last check ${ago(w.last_poll) || "pending"}`) : "Watcher disabled in Settings";
-  if (!IMPORTS.length) { setHTML($("#imports-list"), `<div class="empty">No downloads seen yet. Finished torrents in the downloads folder show up here.</div>`); return; }
-  setHTML($("#imports-list"), IMPORTS.map((imp) => `
+  if (!IMPORTS.length && !other.length) { setHTML($("#imports-list"), `<div class="empty">No downloads seen yet. Finished torrents in the downloads folder show up here.</div>`); return; }
+  setHTML($("#imports-list"), other.map((c) => `<div class="entry">${copyBar(c)}</div>`).join("") + IMPORTS.map((imp) => `
     <div class="entry"><div class="head">${badge(imp.status)}<span class="name">${esc(imp.entry)}</span>
       <span class="muted">${esc(imp.message || "")} · ${ago(imp.updated)}</span>
       <button class="small" data-a="imp" data-id="${imp.id}:retry">Retry</button>
       ${imp.status !== "ignored" ? `<button class="small" data-a="imp" data-id="${imp.id}:ignore">Ignore</button>` : ""}
       <button class="small danger" data-a="imp" data-id="${imp.id}:forget" title="Forget it (it will be picked up again on the next check)">Forget</button></div>
+      ${copiesFor(imp).map((c) => copyBar(c)).join("")}
       ${imp.items.length ? itemRows(imp.items) : ""}</div>`).join(""));
 }
 

@@ -147,6 +147,58 @@ def override_item(item_id: int, fields: dict) -> dict | None:
 
 
 # ------------------------------------------------------------------ file operations
+# copies in progress (imports, and moves between datasets), keyed by destination; read by /api/status
+_copies: dict[str, dict] = {}
+_copies_lock = threading.Lock()
+COPY_CHUNK = 16 * 1024 * 1024
+
+
+SPEED_WINDOW = 10.0     # seconds of recent copying the speed (and time left) is measured over
+
+
+def copy_progress() -> list[dict]:
+    """Running copies with their progress, recent speed (bytes/s) and estimated seconds left. The speed is
+    measured over the last few seconds, not since the start: a copy often begins fast (into the page cache)
+    and settles to the disks' real speed, and an average would keep promising too little time left."""
+    with _copies_lock:
+        out = [dict(c, dst=d) for d, c in _copies.items()]
+    for c in out:
+        samples = c.pop("samples", [])
+        speed = None
+        if samples and time.time() - samples[-1][0] > 5:
+            pass                # nothing written for a while (the disk is busy): no speed, no promise
+        elif len(samples) >= 2 and samples[-1][0] - samples[0][0] >= 1:
+            (t0, d0), (t1, d1) = samples[0], samples[-1]
+            speed = (d1 - d0) / (t1 - t0)
+        c["speed"] = speed
+        c["eta"] = int((c["total"] - c["done"]) / speed) if speed else None
+    return out
+
+
+def _copy_with_progress(src: str, tmp: str, dst: str, mode: str) -> None:
+    total = os.path.getsize(src)
+    now = time.time()
+    entry = {"src": src, "name": os.path.basename(dst), "total": total, "done": 0, "started": now,
+             "mode": mode, "samples": [(now, 0)]}
+    with _copies_lock:
+        _copies[dst] = entry
+    try:
+        with open(src, "rb") as fi, open(tmp, "wb") as fo:
+            while True:
+                buf = fi.read(COPY_CHUNK)
+                if not buf:
+                    break
+                fo.write(buf)
+                entry["done"] += len(buf)
+                now = time.time()
+                # (time, bytes) samples over the last SPEED_WINDOW seconds, replaced as a whole so a reader
+                # never sees a list being changed
+                entry["samples"] = [s for s in entry["samples"] if now - s[0] <= SPEED_WINDOW] + [(now, entry["done"])]
+    finally:
+        with _copies_lock:
+            _copies.pop(dst, None)
+
+
 SPACE_MARGIN = 2 * 1024 ** 3      # keep this much free on a dataset after copying into it
 
 
@@ -198,8 +250,7 @@ def transfer(src: str, dst: str, mode: str) -> str:
                                     f"(file + 2 GB margin), {gb(free)} free")
     tmp = os.path.join(os.path.dirname(dst), "." + os.path.basename(dst) + ".mediaman-part")
     try:
-        with open(src, "rb") as fi, open(tmp, "wb") as fo:
-            shutil.copyfileobj(fi, fo, 16 * 1024 * 1024)
+        _copy_with_progress(src, tmp, dst, mode)
         os.replace(tmp, dst)
     finally:
         if os.path.exists(tmp):

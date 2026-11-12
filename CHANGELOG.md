@@ -2,6 +2,13 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.8.2 — 2026-11-12
+
+- Copies into the library show live progress: the Downloads page shows a progress bar on the download being
+  copied (size, percentage, speed, time left), and Overview shows it on the downloads card. Moves between
+  datasets show the same way. Speed and time left are measured over the last 10 seconds, so they settle to
+  the disks' real speed instead of the burst at the start.
+
 ## 1.8.1 — 2026-11-10
 
 - Fixed: HEVC transcodes (Dolby Vision and HDR10+ titles) dropped the HDR10 light levels (MaxCLL/MaxFALL)

@@ -110,3 +110,50 @@ def test_log_is_bounded_and_housekeeping(tmp_path, monkeypatch):
     r = db.housekeeping()
     assert r["lookups"] >= 1 and r["probes"] >= 1
     assert db.one("SELECT COUNT(*) n FROM log")["n"] <= 50
+
+
+def test_copy_reports_progress(tmp_path, monkeypatch):
+    """A long copy shows up in copy_progress() while it runs (size, bytes done), and disappears when done."""
+    import builtins
+    import threading
+    import time as _t
+    src = tmp_path / "dl" / "Film.mkv"
+    src.parent.mkdir()
+    src.write_bytes(os.urandom(4 * 1024 * 1024))
+    dst = tmp_path / "lib" / "Film (2001)" / "Film (2001).mkv"
+    monkeypatch.setattr(organizer, "COPY_CHUNK", 256 * 1024)
+    gate = threading.Event()
+
+    class SlowFile:
+        def __init__(self, f):
+            self.f = f
+        def read(self, n):
+            gate.wait(5)                       # the test lets each chunk through after looking
+            gate.clear()
+            return self.f.read(n)
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            self.f.close()
+
+    real_open = builtins.open
+    monkeypatch.setattr(organizer, "open", lambda p, m="r", *a, **k: SlowFile(real_open(p, m)) if str(p) == str(src)
+                        else real_open(p, m, *a, **k), raising=False)
+    t = threading.Thread(target=organizer.transfer, args=(str(src), str(dst), "copy"))
+    t.start()
+    seen = []
+    for _ in range(40):
+        gate.set()
+        _t.sleep(0.02)
+        seen += [c for c in organizer.copy_progress() if c["dst"] == str(dst)]
+        if not t.is_alive():
+            break
+    while t.is_alive():
+        gate.set()
+        _t.sleep(0.01)
+    t.join()
+    mid = [c for c in seen if 0 < c["done"] < c["total"]]
+    assert mid and mid[0]["total"] == 4 * 1024 * 1024 and mid[0]["name"] == "Film (2001).mkv"
+    assert mid[0]["mode"] == "copy" and mid[0]["src"] == str(src)
+    assert organizer.copy_progress() == []                       # finished copies are removed
+    assert dst.read_bytes() == src.read_bytes()
