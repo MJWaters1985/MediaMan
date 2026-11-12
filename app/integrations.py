@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import threading
 import time
 
@@ -121,18 +122,52 @@ def jellyfin_refresh() -> bool:
         r = tlschain.request("POST", url + "/Library/Refresh", headers=_jf_headers(), timeout=15,
                              enabled=config.get("jellyfin_verify_tls"))
         if r.status_code >= 400:
-            db.log("warn", "jellyfin", f"refresh failed: {_jf_explain(r)}")
+            _jf_warn(f"refresh failed: {_jf_explain(r)}")
             return False
         db.log("info", "jellyfin", "library refresh requested")
         return True
     except Exception as e:
-        db.log("warn", "jellyfin", f"refresh failed: {tlschain.explain(e)}")
+        _jf_warn(f"refresh failed: {tlschain.explain(e)}")
         return False
 
 
 _changes: dict[str, str] = {}
 _changes_lock = threading.Lock()
 _folders = {"ts": 0.0, "locations": []}
+# when Jellyfin can't be reached, the changes are kept (also on disk, so a restart doesn't lose them) and retried
+# after a growing delay; only the first failure of an outage is logged, and the catch-up once it's over
+_jf_retry = {"next": 0.0, "delay": 0, "failing": False}
+JF_RETRY_MAX = 1800
+
+
+def _pending_file() -> str:
+    return os.path.join(config.CONFIG_DIR, "jellyfin-pending.json")
+
+
+def _load_pending() -> None:
+    try:
+        with open(_pending_file()) as f:
+            saved = json.load(f)
+        with _changes_lock:
+            for path, kind in saved.items():
+                _changes.setdefault(path, kind)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _save_pending() -> None:
+    try:
+        with _changes_lock:
+            data = dict(_changes)
+        if data:
+            tmp = _pending_file() + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, _pending_file())
+        elif os.path.exists(_pending_file()):
+            os.unlink(_pending_file())
+    except OSError:
+        pass
 
 
 def jellyfin_changed(path: str, kind: str = "Modified") -> None:
@@ -143,7 +178,13 @@ def jellyfin_changed(path: str, kind: str = "Modified") -> None:
 
 
 def jellyfin_pending() -> bool:
-    return bool(_changes)
+    """Changes are waiting and, after a failure, the retry delay has passed."""
+    return bool(_changes) and time.time() >= _jf_retry["next"]
+
+
+def _jf_warn(msg: str) -> None:
+    if not _jf_retry["failing"]:        # one warning per outage
+        db.log("warn", "jellyfin", msg)
 
 
 def _jf_locations() -> list[str]:
@@ -183,14 +224,36 @@ def map_to_jellyfin(path: str, mine: list[str], theirs: list[str]) -> str | None
 
 
 def jellyfin_flush() -> bool:
-    """Tell Jellyfin exactly which files changed (it rescans just those folders). Falls back to a full library
-    refresh when a path can't be matched to one of Jellyfin's folders."""
+    """Tell Jellyfin about the changed files. If it can't be reached, the changes are kept and retried later
+    (1 minute, then doubling up to 30), so an outage — a Jellyfin restart, a certificate problem — catches up."""
     with _changes_lock:
         changes = dict(_changes)
         _changes.clear()
     url, key = _jf_url(), config.get("jellyfin_api_key")
     if not changes or not url or not key:
+        _save_pending()
         return False
+    ok = _jf_send(changes, url)
+    if ok:
+        if _jf_retry["failing"]:
+            db.log("info", "jellyfin", "reachable again — caught up on the changes it missed")
+        _jf_retry.update(next=0.0, delay=0, failing=False)
+    else:
+        with _changes_lock:
+            for path, kind in changes.items():
+                _changes.setdefault(path, kind)       # a newer change to the same file wins
+        delay = min(JF_RETRY_MAX, max(60, _jf_retry["delay"] * 2))
+        if not _jf_retry["failing"]:
+            db.log("info", "jellyfin", f"keeping {len(changes)} change{'s' if len(changes) != 1 else ''} to send "
+                                       "once Jellyfin can be reached")
+        _jf_retry.update(next=time.time() + delay, delay=delay, failing=True)
+    _save_pending()
+    return ok
+
+
+def _jf_send(changes: dict[str, str], url: str) -> bool:
+    """Tell Jellyfin exactly which files changed (it rescans just those folders). Falls back to a full library
+    refresh when a path can't be matched to one of Jellyfin's folders."""
     from .organizer import library_dirs
     mine = library_dirs("movies") + library_dirs("tv")
     try:
@@ -206,13 +269,16 @@ def jellyfin_flush() -> bool:
         r = tlschain.request("POST", url + "/Library/Media/Updated", headers=_jf_headers(), json={"Updates": updates},
                              timeout=15, enabled=config.get("jellyfin_verify_tls"))
         if r.status_code >= 400:
-            db.log("warn", "jellyfin", f"update failed: {_jf_explain(r)} — refreshing the whole library instead")
+            _jf_warn(f"update failed: {_jf_explain(r)} — refreshing the whole library instead")
             return jellyfin_refresh()
         db.log("info", "jellyfin", f"told Jellyfin about {len(updates)} changed file{'s' if len(updates) != 1 else ''}")
         return True
     except Exception as e:
-        db.log("warn", "jellyfin", f"update failed: {tlschain.explain(e)} — refreshing the whole library instead")
+        _jf_warn(f"update failed: {tlschain.explain(e)} — refreshing the whole library instead")
         return jellyfin_refresh()
+
+
+_load_pending()
 
 
 def jellyfin_test() -> str:

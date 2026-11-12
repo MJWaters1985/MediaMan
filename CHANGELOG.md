@@ -2,6 +2,13 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.8.4 — 2026-11-12
+
+- Jellyfin updates are no longer lost when Jellyfin can't be reached (a restart, an update, a certificate
+  problem): the changed files are kept, also across a MediaMan restart, and sent once it's back, retrying
+  after 1 minute and then less often (up to every 30 minutes). An outage logs one warning, and a note when
+  it has caught up.
+
 ## 1.8.3 — 2026-11-12
 
 - Fixed: some Dolby Vision profile 7 discs (with the enhancement layer stored as Matroska block additions)

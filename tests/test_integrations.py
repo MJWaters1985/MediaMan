@@ -231,3 +231,50 @@ def test_qbit_blips_are_not_logged_but_lasting_outages_are(monkeypatch):
     integrations.qbit_state.update(error=None, failing_since=None, warned=False)
     integrations._qbit_failed("username or password rejected by qBittorrent", True)   # a rejected login: at once
     assert len(logged) == 2 and "rejected" in logged[1][1]
+
+
+def test_jellyfin_changes_are_kept_until_it_can_be_reached(tmp_path, monkeypatch):
+    from app import db
+    logged = []
+    monkeypatch.setattr(db, "log", lambda level, area, msg: logged.append((level, msg)))
+    clock = [5000.0]
+    monkeypatch.setattr(integrations.time, "time", lambda: clock[0])
+    monkeypatch.setattr(integrations, "_pending_file", lambda: str(tmp_path / "pending.json"))
+    integrations._jf_retry.update(next=0.0, delay=0, failing=False)
+    integrations._changes.clear()
+    movies = str(tmp_path / "Share" / "Media" / "Movies")
+    config.update({"jellyfin_url": "http://127.0.0.1:9", "jellyfin_api_key": "good", "movies_dir": movies})
+    integrations._folders.update(ts=0)
+    film = movies + "/Goodfellas (1990)/Goodfellas (1990).mkv"
+    integrations.jellyfin_changed(film, "Modified")
+
+    assert integrations.jellyfin_flush() is False                     # Jellyfin is down: kept, on disk too
+    assert integrations._changes == {film: "Modified"}
+    assert json.load(open(tmp_path / "pending.json")) == {film: "Modified"}
+    warns = [m for lvl, m in logged if lvl == "warn"]
+    assert warns and any("keeping 1 change" in m for _, m in logged)
+    assert not integrations.jellyfin_pending()                        # waits a minute before trying again
+    clock[0] += 61
+    assert integrations.jellyfin_pending()
+    n = len(logged)
+    assert integrations.jellyfin_flush() is False                     # still down: no new warning, longer wait
+    assert [m for lvl, m in logged[n:] if lvl == "warn"] == [] and integrations._jf_retry["delay"] == 120
+
+    integrations._changes.clear()                                     # a restart: the saved changes come back
+    integrations._load_pending()
+    assert integrations._changes == {film: "Modified"}
+
+    srv = HTTPServer(("127.0.0.1", 0), FakeJellyfinLibrary)          # Jellyfin is back
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        config.update({"jellyfin_url": f"http://127.0.0.1:{srv.server_port}"})
+        integrations._folders.update(ts=0)
+        clock[0] += 121
+        assert integrations.jellyfin_flush() is True
+        assert FakeJellyfinLibrary.posts[-1][1]["Updates"] == [
+            {"Path": "/Media/Movies/Goodfellas (1990)/Goodfellas (1990).mkv", "UpdateType": "Modified"}]
+        assert any("caught up" in m for _, m in logged)
+        assert not integrations._changes and not (tmp_path / "pending.json").exists()
+        assert integrations._jf_retry == {"next": 0.0, "delay": 0, "failing": False}
+    finally:
+        srv.shutdown()

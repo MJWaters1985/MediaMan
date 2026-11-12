@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth, config, db, fsbrowse, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="MediaMan", version=VERSION)
