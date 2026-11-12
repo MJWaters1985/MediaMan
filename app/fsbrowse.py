@@ -64,3 +64,30 @@ def listing(path: str | None) -> dict:
     return {"path": real, "parent": parent, "roots": rts,
             "dirs": [{"name": n, "path": os.path.join(real, n)} for n in names[:MAX_ENTRIES]],
             "truncated": len(names) > MAX_ENTRIES, "writable": os.access(real, os.W_OK)}
+
+
+def make_folder(path: str) -> dict:
+    """Create `path` (and any missing parents) inside a mounted folder, for a fresh install whose media storage is
+    still empty. Refuses anything outside the mounts, hidden names and a path whose existing part isn't writable.
+    Folders are created with the default permissions, so they inherit the dataset's ACL like everything MediaMan
+    writes. Returns the new folder's listing."""
+    rts = roots()
+    path = (path or "").strip()
+    if not path.startswith("/"):
+        raise ValueError("give the full path of the new folder")
+    real = os.path.realpath(path)
+    if not _inside(real, rts) or real in rts:
+        raise ValueError("new folders can only be made inside the folders mounted into MediaMan")
+    existing = real
+    while not os.path.isdir(existing):
+        existing = os.path.dirname(existing)
+    new_parts = os.path.relpath(real, existing).split(os.sep) if real != existing else []
+    if any(not n or n.startswith(".") or len(n) > 255 for n in new_parts):
+        raise ValueError("folder names can't be empty or start with a dot")
+    if new_parts and not os.access(existing, os.W_OK):
+        raise ValueError(f"MediaMan can't write to {existing}")
+    try:
+        os.makedirs(real, exist_ok=True)
+    except OSError as e:
+        raise ValueError(f"couldn't create the folder: {e.strerror or e}")
+    return listing(real)

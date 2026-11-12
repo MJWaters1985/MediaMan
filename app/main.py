@@ -150,6 +150,17 @@ def browse_folders(path: str = ""):
         raise HTTPException(400, str(e))
 
 
+@app.post("/api/fs/mkdir")
+def make_folder(body: dict = Body(...)):
+    """Folder picker / setup wizard: create a folder inside a mounted folder (a new install's storage is empty)."""
+    try:
+        d = fsbrowse.make_folder(str(body.get("path") or ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    db.log("info", "app", f"created folder {d['path']}")
+    return d
+
+
 @app.post("/api/auth/password")
 def change_password(body: dict = Body(...)):
     """Set, change or remove (empty "new") the web UI password. The current one is required to change it."""

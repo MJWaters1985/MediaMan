@@ -45,3 +45,23 @@ def test_listing_stays_inside_the_mounts(tmp_path, monkeypatch):
     for bad in (str(outside), str(media / "escape"), str(media / ".." / "outside"), "/etc"):
         with pytest.raises(ValueError):
             fsbrowse.listing(bad)
+
+
+def test_make_folder_only_inside_the_mounts(tmp_path, monkeypatch):
+    media = tmp_path / "media"
+    media.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.symlink(outside, media / "escape")
+    monkeypatch.setattr(fsbrowse, "roots", lambda *a: [str(media)])
+
+    d = fsbrowse.make_folder(str(media / "Movies"))
+    assert d["path"] == str(media / "Movies") and (media / "Movies").is_dir()
+    fsbrowse.make_folder(str(media / "Shows" / "Kids"))             # missing parents are made too
+    assert (media / "Shows" / "Kids").is_dir()
+    assert fsbrowse.make_folder(str(media / "Movies"))["path"] == str(media / "Movies")   # already there is fine
+    for bad in (str(media), str(outside / "x"), str(media / "escape" / "x"), str(media / ".." / "x"),
+                str(media / ".hidden"), str(media / "a" / ".b"), "Movies", "/etc/x", ""):
+        with pytest.raises(ValueError):
+            fsbrowse.make_folder(bad)
+    assert not (outside / "x").exists() and not (tmp_path / "x").exists() and not (media / "a").exists()

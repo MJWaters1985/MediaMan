@@ -17,6 +17,9 @@ All notable changes to MediaMan. Versions follow [semantic versioning](https://s
 - Overview and the Transcode queue warn when the app's CPU or memory limits are too low for 4K transcodes,
   say how much to give it, and point to where TrueNAS sets them (*Apps → MediaMan → Edit → Resources
   Configuration*).
+- The setup wizard offers to create the Movies, Shows and downloads folders when they don't exist yet (as
+  on a new install with an empty Media storage), and the folder picker has a *New folder…* button. Both
+  only work inside the folders mounted into MediaMan.
 - MediaMan is in the TrueNAS apps catalog: the README covers installing it from there (including
   switching Media Storage to a Host Path for an existing library), with the YAML install as the alternative.
 

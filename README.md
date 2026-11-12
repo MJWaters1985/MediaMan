@@ -156,7 +156,8 @@ MediaMan is in the TrueNAS apps catalog (community train).
    - **Resources**: the defaults (2 CPUs, 4 GB) are enough for organizing and importing. For 4K
      transcodes, give it 8 or more CPUs and 8–16 GB, and pass through a GPU if you have one.
 3. Click **Web UI** on the installed app. A setup wizard walks through:
-   - the folders, picked with **Browse…** from what's mounted, each checked for write access
+   - the folders, picked with **Browse…** from what's mounted, each checked for write access (on a
+     new, empty Media Storage it offers to create them)
    - Jellyfin and qBittorrent, each with a Test button
    - the automation and safety settings
    - an optional password

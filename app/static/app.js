@@ -433,8 +433,15 @@ async function folderPicker(start, onPick) {
         ${d.truncated ? '<div class="muted" style="padding:6px 10px">Showing the first 2000 folders</div>' : ""}
       </div>
       <p class="muted" style="margin:10px 0 0;font-size:12px">${d.path ? `${esc(d.path)} — ${d.writable ? "writable" : "<b>not writable</b> by MediaMan"}` : "These are the folders mounted into MediaMan. Add more in the app's storage settings in TrueNAS."}</p>
-      <div class="dlg-actions"><button value="cancel">Cancel</button><button value="pick" class="primary" ${d.path ? "" : "disabled"}>Use this folder</button></div>`;
+      <div class="dlg-actions">${d.path && d.writable ? '<button type="button" id="fp-new" style="margin-right:auto">New folder…</button>' : ""}<button value="cancel">Cancel</button><button value="pick" class="primary" ${d.path ? "" : "disabled"}>Use this folder</button></div>`;
     $$("[data-go]", f).forEach((b) => b.onclick = () => show(b.dataset.go));
+    if ($("#fp-new", f)) $("#fp-new", f).onclick = async () => {
+      const name = (prompt(`New folder inside ${d.path}:`) || "").trim();
+      if (!name) return;
+      if (name.includes("/") || name.startsWith(".")) return toast("⚠ Use a plain folder name (no / and not starting with a dot)");
+      try { const n = await api("/api/fs/mkdir", { method: "POST", body: { path: d.path.replace(/\/$/, "") + "/" + name } }); show(n.path); }
+      catch (e) { toast("⚠ " + e.message); }
+    };
   };
   dlg.onclose = () => { if (dlg.returnValue === "pick" && cur) onPick(cur); dlg.onclose = null; };
   dlg.returnValue = "";
@@ -588,14 +595,24 @@ function setupValues(form, step) {
 
 async function checkFolders(form) {
   const box = $("#setup-folder-check"); if (!box) return;
-  const rows = [];
+  const rows = [], missing = [];
   for (const [k, label] of [["movies_dir", "Movies"], ["tv_dir", "Shows"], ["downloads_dir", "Finished downloads"]]) {
     const p = form[k].value.trim();
     if (!p) { rows.push(`${label}: <span class="bad">not set</span>`); continue; }
     const d = await api("/api/fs?path=" + encodeURIComponent(p)).catch((e) => ({ error: e.message }));
+    if (d.error === "folder not found") missing.push(p);
     rows.push(`${label}: ${d.error ? `<span class="bad">${esc(d.error)}</span>` : d.writable ? '<span class="ok">✓ found, writable</span>' : '<span class="warn">found, but MediaMan can\'t write to it</span>'}`);
   }
-  box.innerHTML = rows.join("<br>");
+  box.innerHTML = rows.join("<br>") + (missing.length
+    ? `<div style="margin-top:8px"><button type="button" class="small" id="setup-mkdirs">Create ${missing.length === 1 ? "this folder" : `these ${missing.length} folders`}</button>
+       <span class="muted"> — for a new, empty Media storage</span></div>` : "");
+  if (missing.length) $("#setup-mkdirs").onclick = async () => {
+    for (const p of missing) {
+      try { await api("/api/fs/mkdir", { method: "POST", body: { path: p } }); }
+      catch (e) { toast(`⚠ ${p}: ${e.message}`); break; }
+    }
+    checkFolders(form);
+  };
 }
 
 function renderSetup() {
