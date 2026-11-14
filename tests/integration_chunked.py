@@ -208,10 +208,10 @@ async def main():
     db.x("DELETE FROM jobs")
     jid = db.x("INSERT INTO jobs(path,status,created,plan) VALUES(?,?,?,?)", (src, "queued", time.time(), db.jdump({"force": True})))
     await w.tick()
-    for _ in range(100):
+    for _ in range(150):      # pause once the encoder itself runs (not a short step just about to exit)
         await asyncio.sleep(0.2)
         p = w.procs.get(jid)
-        if p and p.returncode is None:
+        if p and p.returncode is None and (w.stage.get(jid) or {}).get("name") == "Encoding":
             break
     w.paused = True
     await w.tick()
