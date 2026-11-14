@@ -359,3 +359,136 @@ def test_resource_advice_explains_low_limits(monkeypatch):
     monkeypatch.setattr(transcode, "limits", lambda: {"cpus": 16, "memory": 64 * gb})
     r = transcode.resource_advice()
     assert r["warnings"] == [] and r["hint"] == ""
+
+
+def test_next_file_starts_while_one_finishes(monkeypatch):
+    """A job past encoding (joining, metadata, the final mux) stops holding its slot, so the next file starts; at
+    most one job finishes per slot, and with the setting off the queue waits as before."""
+    import asyncio
+    from app import db
+    ids = [db.x("INSERT INTO jobs(path,status,created) VALUES(?,?,?)", (f"/x/overlap{i}.mkv", "queued", i))
+           for i in range(3)]
+    db.x("UPDATE jobs SET status='done' WHERE status='queued' AND id NOT IN (?,?,?)", tuple(ids))
+
+    async def scenario(overlap):
+        gates = {i: asyncio.Event() for i in ids}
+        config.update({"concurrent_jobs": 1, "overlap_finishing": overlap, "queue_paused": False,
+                       "transcode_window": ""})
+        db.x("UPDATE jobs SET status='queued' WHERE id IN (?,?,?)", tuple(ids))
+        w = transcode.Worker()
+        moved = {i: asyncio.Event() for i in ids}
+
+        async def fake_run(job):
+            jid = job["id"]
+            w._steps(jid, ["Encoding", "Final file"])
+            w._enter(jid, "Encoding", "chunk 1 of 1")
+            await moved[jid].wait()
+            w._enter(jid, "Final file")
+            await gates[jid].wait()
+            db.x("UPDATE jobs SET status='done' WHERE id=?", (jid,))
+        w.run = fake_run
+
+        async def settle():
+            for _ in range(5):
+                await asyncio.sleep(0)
+            await w.tick()
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        await settle()
+        assert set(w.tasks) == {ids[0]}
+        moved[ids[0]].set()                       # the first file is past encoding
+        await settle()
+        started = set(w.tasks)
+        moved[ids[1]].set()                       # the second is past encoding too: no third yet
+        await settle()
+        third = ids[2] in w.tasks
+        for g in gates.values():
+            g.set()
+        for m in moved.values():
+            m.set()
+        await asyncio.gather(*w.tasks.values())
+        return started, third
+
+    started, third = asyncio.run(scenario(True))
+    assert started == {ids[0], ids[1]} and not third
+    started, third = asyncio.run(scenario(False))
+    assert started == {ids[0]}
+    config.update({"overlap_finishing": True})
+
+
+def test_step_times_are_kept_across_a_restart(monkeypatch):
+    from app import db
+    clock = [1000.0]
+    monkeypatch.setattr(transcode.time, "time", lambda: clock[0])
+    jid = db.x("INSERT INTO jobs(path,status) VALUES(?,?)", ("/x/timed.mkv", "running"))
+    w = transcode.Worker()
+    w._steps(jid, ["Quality search", "Encoding", "Final file"])
+    w._enter(jid, "Quality search")
+    clock[0] += 600
+    w._enter(jid, "Encoding")
+    clock[0] += 3600
+    w._close_step(jid)                            # a restart mid-encode saves the time so far
+    assert db.jload(db.one("SELECT steps FROM jobs WHERE id=?", (jid,))["steps"]) == \
+        {"Quality search": 600.0, "Encoding": 3600.0}
+    w2 = transcode.Worker()                       # the resumed run adds to it
+    w2._steps(jid, ["Encoding", "Final file"])
+    w2._enter(jid, "Encoding")
+    clock[0] += 1800
+    w2._enter(jid, "Final file")
+    clock[0] += 120
+    w2._close_step(jid)
+    assert db.jload(db.one("SELECT steps FROM jobs WHERE id=?", (jid,))["steps"]) == \
+        {"Quality search": 600.0, "Encoding": 5400.0, "Final file": 120.0}
+    assert jid in w2.finishing and jid not in w.finishing
+
+
+def test_space_for_a_finishing_file_is_kept_free(tmp_path, monkeypatch):
+    from app import organizer
+    w = transcode.Worker()
+    wd = tmp_path / ".Film.mediaman-work"
+    wd.mkdir()
+    (wd / "video.hevc").write_bytes(b"x" * 300)
+    w.peak[1] = (str(wd), str(tmp_path / ".Film.mediaman.mkv"), 1000)
+    w.finishing.add(1)
+    assert w.finishing_need(2) == 700             # its peak, minus what's already on disk
+    assert w.finishing_need(1) == 0               # a job doesn't count itself
+    monkeypatch.setattr(organizer, "free_bytes", lambda p: organizer.SPACE_MARGIN + 10 ** 6)
+    path = str(tmp_path / "Next.mkv")
+    plan = {"workdir": str(tmp_path / ".Next.mediaman-work"), "codec": "hevc"}
+    s = dict(S(), bpp=0.06)
+    assert transcode.space_problem(path, s, plan, 10 ** 5) is None
+    msg = transcode.space_problem(path, s, plan, 10 ** 5, reserved=10 ** 6)
+    assert msg and "finishing" in msg
+
+
+def test_a_file_waits_for_space_a_finishing_file_holds(tmp_path, monkeypatch):
+    """Short of space only because of a file that's finishing: the next file waits for it instead of failing."""
+    import asyncio
+    from app import db, organizer, probe
+    src = tmp_path / "Wait.mkv"
+    src.write_bytes(b"x" * 1000)
+    jid = db.x("INSERT INTO jobs(path,status) VALUES(?,?)", (str(src), "running"))
+    monkeypatch.setattr(probe, "ffprobe", lambda p, cached=True: {})
+    monkeypatch.setattr(probe, "summarize", lambda d: S())
+    monkeypatch.setattr(transcode, "make_plan", lambda p, s, force=False, crf=None: {
+        "transcode": True, "workdir": str(tmp_path / ".Wait.mediaman-work"), "tmp": str(tmp_path / ".Wait.tmp.mkv"),
+        "codec": "hevc", "reason": "test"})
+    monkeypatch.setattr(organizer, "free_bytes", lambda p: organizer.SPACE_MARGIN + 10 ** 6)
+    w = transcode.Worker()
+    w.finishing.add(99)
+    w.peak[99] = (str(tmp_path / "none"), str(tmp_path / "none.mkv"), 10 ** 7)
+    ran = []
+
+    async def fake_encode(*a):
+        ran.append(True)
+    w._encode_and_replace = fake_encode
+
+    async def go():
+        task = asyncio.create_task(w._run(jid, str(src), False))
+        await asyncio.sleep(0.05)
+        assert not ran and "waiting" in db.one("SELECT message FROM jobs WHERE id=?", (jid,))["message"]
+        w.finishing.discard(99)                    # the other file is done
+        await asyncio.wait_for(task, 10)
+    asyncio.run(go())
+    assert ran

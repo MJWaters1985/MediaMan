@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth, config, db, fsbrowse, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.8.4"
+VERSION = "1.8.5"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="MediaMan", version=VERSION)
@@ -340,6 +340,7 @@ def list_jobs(status: str = "", limit: int = 300):
         p = db.jload(r["plan"]) or {}
         r["backend"], r["codec"], r["reason"] = p.get("backend"), p.get("codec"), p.get("reason")
         r["stage"] = transcode.worker.stage_view(r["id"]) if r["status"] in ("running", "paused") else None
+        r["steps"] = db.jload(r.get("steps")) or None
         r.pop("plan")
     return rows
 
@@ -373,9 +374,9 @@ def job_action(job_id: int, action: str):
         if not transcode.worker.pause_job(job_id, action == "pause"):
             raise HTTPException(409, "job is not running")
     elif action == "retry":
-        db.x("UPDATE jobs SET status='queued', progress=0, message=NULL, finished=NULL WHERE id=?", (job_id,))
+        db.x("UPDATE jobs SET status='queued', progress=0, message=NULL, finished=NULL, steps=NULL WHERE id=?", (job_id,))
     elif action == "force":
-        db.x("UPDATE jobs SET status='queued', progress=0, message=NULL, finished=NULL, plan=? WHERE id=?",
+        db.x("UPDATE jobs SET status='queued', progress=0, message=NULL, finished=NULL, steps=NULL, plan=? WHERE id=?",
              (db.jdump({"force": True}), job_id))
     elif action == "top":
         top = (db.one("SELECT MAX(priority) p FROM jobs WHERE status='queued'") or {}).get("p") or 0

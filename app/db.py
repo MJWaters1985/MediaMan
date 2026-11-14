@@ -65,6 +65,9 @@ def conn() -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.executescript(SCHEMA)
+        cols = {r[1] for r in _conn.execute("PRAGMA table_info(jobs)")}
+        if "steps" not in cols:     # 1.8.5: seconds spent in each step, as JSON
+            _conn.execute("ALTER TABLE jobs ADD COLUMN steps TEXT")
     return _conn
 
 

@@ -2,6 +2,15 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.8.5 — 2026-11-13
+
+- The next file starts encoding as soon as the current one's encoding is done, instead of waiting through
+  its last steps (joining the chunks, Dolby Vision or HDR10+ metadata, audio and subtitles, the final file,
+  the check), which mostly copy files and leave the CPU idle. At most one file finishes per parallel job,
+  and the free-space check counts the space a finishing file still needs. It can be turned off in
+  Settings → Transcoding (*Start the next file while one finishes*).
+- Finished jobs show how long each step took, including time before a restart.
+
 ## 1.8.4 — 2026-11-12
 
 - Jellyfin updates are no longer lost when Jellyfin can't be reached (a restart, an update, a certificate

@@ -302,6 +302,13 @@ function jobProgress(j) {
   return stepLine + bar + readLine + enc + steps;
 }
 
+// a finished job: how long each step took (the encode, and the steps after it the next file overlaps with)
+function stepTimes(t) {
+  if (!t) return "";
+  const parts = Object.entries(t).filter(([, s]) => s >= 1).map(([n, s]) => `${esc(n)} ${fmtDur(Math.round(s))}`);
+  return parts.length ? `<div class="meta">Time: ${parts.join(" · ")}</div>` : "";
+}
+
 async function loadQueue() {
   const jobs = await api("/api/jobs");
   const q = STATUS.queue || {};
@@ -322,7 +329,7 @@ async function loadQueue() {
         ${["failed", "cancelled"].includes(j.status) ? `<button class="small" data-a="job" data-id="${j.id}:retry">Retry</button>` : ""}
         ${j.status === "skipped" ? `<button class="small" data-a="job" data-id="${j.id}:force">Transcode anyway</button>` : ""}
       </div></div>
-      ${active ? jobProgress(j) : `<div class="meta">${esc(j.message || j.reason || "")}${saved}${j.finished ? " · " + ago(j.finished) : ""}</div>`}</div>`;
+      ${active ? jobProgress(j) : `<div class="meta">${esc(j.message || j.reason || "")}${saved}${j.finished ? " · " + ago(j.finished) : ""}</div>${stepTimes(j.steps)}`}</div>`;
   }).join(""));
 }
 
@@ -363,6 +370,7 @@ const FIELDS = [
     ["audio_policy", "Audio", "select:copy|eac3_lossless", "eac3_lossless converts TrueHD/DTS-HD/FLAC/PCM to EAC3 640k."],
     ["min_savings_pct", "Min savings (%)", "number", "Results that save less are discarded and the original kept."],
     ["concurrent_jobs", "Parallel jobs", "number", ""],
+    ["overlap_finishing", "Start the next file while one finishes", "bool", "On: once a file's encoding is done, the next file starts while the first is still being put together (joining, HDR metadata, audio and subtitles, the final check). Those steps mostly copy files, so the CPU would otherwise sit idle. At most one file finishes per parallel job, and the space it still needs is kept free."],
     ["resume_queue_on_startup", "Resume transcoding after a restart", "bool", "On: after MediaMan, the app or the NAS restarts, interrupted jobs continue (chunked encodes from their last finished chunk). Off: the queue comes back paused until you press Resume queue. A queue you paused yourself stays paused either way."],
     ["transcode_window", "Only run between", "text", "e.g. 01:00-07:00. Empty = any time. Outside the window a running job is frozen mid-film and continues when it reopens."],
     ["keep_originals", "Keep originals", "bool", "Move replaced files into .mediaman-trash in the library instead of deleting them."],

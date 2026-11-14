@@ -128,6 +128,14 @@ Cancelling a job deletes its work folder, and so does a job that turns out to be
 after a settings change). The daily clean-up also removes any work folder that no waiting job will use
 and that hasn't been touched for 2 days, so a failed job retried within that time still resumes.
 
+**Starting the next file early:** after a file's encoding is done, the remaining steps (joining the
+chunks, Dolby Vision or HDR10+ metadata, audio and subtitles, the final file, the check) mostly copy and
+rewrite big files, so the CPU would sit idle. With **Start the next file while one finishes** on (the
+default, Settings → Transcoding), the next file in the queue starts meanwhile. Each parallel job can
+have at most one file finishing beside it, and the free-space check for the new file counts the space
+the finishing file still needs. Each finished job shows how long its steps took (*Time: Quality search
+· Encoding · …*), kept across restarts.
+
 **Restarts and shutdowns:** stopping the app, restarting the app pool or shutting down the NAS sends
 MediaMan the normal container stop signal. It shuts down in about a second and keeps the finished
 chunks, so a chunked encode resumes from its last finished chunk (at most 2 minutes of video is

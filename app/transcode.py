@@ -729,6 +729,12 @@ def in_window(now: dt.datetime | None = None) -> bool:
     return a <= t < b if a <= b else (t >= a or t < b)
 
 
+# Steps after the encoder has finished: they copy and rewrite big files (mostly disk, little CPU), so the next file
+# can start encoding meanwhile
+FINISH_STEPS = frozenset({"Joining chunks", "Preparing the video stream", "Dolby Vision metadata", "HDR10+ metadata",
+                          "Audio and subtitles", "Final file", "Checking the result"})
+
+
 class Worker:
     def __init__(self):
         self.procs: dict[int, asyncio.subprocess.Process] = {}
@@ -738,6 +744,9 @@ class Worker:
         self.held: set[int] = set()       # jobs frozen because the queue is paused / outside the time window
         self.last: dict[int, dict] = {}   # last ffmpeg progress block per job
         self.stage: dict[int, dict] = {}  # the step a running job is on (shown in the queue)
+        self.finishing: set[int] = set()  # running jobs past encoding (they no longer hold a queue slot)
+        self.times: dict[int, dict] = {}  # seconds spent in each step, per running job (saved in jobs.steps)
+        self.peak: dict[int, tuple] = {}  # running job → (work folder, new file, peak disk space it needs)
 
     @property
     def paused(self) -> bool:
@@ -758,14 +767,30 @@ class Worker:
     # ------------------------------------------------------------ steps (what a running job is doing)
     def _steps(self, jid: int, names: list[str]):
         self.stage[jid] = {"steps": names, "index": 0, "name": names[0] if names else "", "detail": None,
-                           "progress": None, "started": time.time()}
+                           "progress": None, "started": time.time(), "entered": False}
+        if jid not in self.times:      # a resumed job adds to the time it spent before the restart
+            self.times[jid] = (db.jload((db.one("SELECT steps FROM jobs WHERE id=?", (jid,)) or {}).get("steps"))
+                               or {})
+
+    def _close_step(self, jid: int):
+        """Add the time spent in the current step to the job's step times (and save them)."""
+        st = self.stage.get(jid)
+        if not st or not st.get("entered"):
+            return
+        t = self.times.setdefault(jid, {})
+        t[st["name"]] = round(t.get(st["name"], 0) + time.time() - st["started"], 1)
+        st["started"], st["entered"] = time.time(), False
+        db.x("UPDATE jobs SET steps=? WHERE id=?", (db.jdump(t), jid))
 
     def _enter(self, jid: int, name: str, detail: str | None = None, progress: float | None = None):
+        self._close_step(jid)
         steps = (self.stage.get(jid) or {}).get("steps") or []
         if name not in steps:
             steps = steps + [name]
         self.stage[jid] = {"steps": steps, "index": steps.index(name), "name": name, "detail": detail,
-                           "progress": progress, "started": time.time()}
+                           "progress": progress, "started": time.time(), "entered": True}
+        if name in FINISH_STEPS:
+            self.finishing.add(jid)
         db.x("UPDATE jobs SET message=? WHERE id=?", (detail or name, jid))
 
     def _detail(self, jid: int, detail: str | None = None, progress: float | None = None):
@@ -851,13 +876,26 @@ class Worker:
                 self._set_status(jid)
         if hold:
             return
-        slots = max(1, int(config.get("concurrent_jobs") or 1)) - len(self.tasks)
+        slots = self.free_slots()
         if slots <= 0:
             return
         for job in db.q("SELECT * FROM jobs WHERE status='queued' ORDER BY priority DESC, id LIMIT ?", (slots,)):
             db.x("UPDATE jobs SET status='running', started=?, progress=0, message=NULL WHERE id=?",
                  (time.time(), job["id"]))
             self.tasks[job["id"]] = asyncio.create_task(self.run(job))
+
+    def free_slots(self) -> int:
+        """How many jobs may start now. A job past encoding (joining, metadata, the final mux, the check) mostly
+        copies files, so with "overlap_finishing" it stops holding its slot and the next file starts encoding
+        meanwhile. Each slot can have at most one job finishing, so jobs never pile up behind a slow disk."""
+        n = max(1, int(config.get("concurrent_jobs") or 1))
+        busy = len(self.tasks)
+        if config.get("overlap_finishing"):
+            finishing = len(self.finishing & set(self.tasks))
+            if finishing > n:
+                return 0
+            busy -= finishing
+        return n - busy
 
     def cancel(self, jid: int):
         self.cancelled.add(jid)
@@ -893,10 +931,15 @@ class Worker:
             db.x("UPDATE jobs SET status='failed', message=?, finished=? WHERE id=?", (str(e)[:2000], time.time(), jid))
             db.log("error", "transcode", f"{path}: {e}")
         finally:
+            self._close_step(jid)
             self.procs.pop(jid, None)
             self.manual.discard(jid)
             self.held.discard(jid)
             self.last.pop(jid, None)
+            self.finishing.discard(jid)
+            self.peak.pop(jid, None)
+            self.times.pop(jid, None)
+            self.stage.pop(jid, None)
 
     async def _run(self, jid: int, path: str, force: bool):
         if not os.path.exists(path):
@@ -917,11 +960,20 @@ class Worker:
                 db.log("info", "transcode", f"{os.path.basename(path)}: skipped — removed {freed / 1024 ** 3:.1f} GB "
                                             f"of work files from an earlier run")
             return
-        problem = space_problem(path, s, plan, orig_size)
+        problem = space_problem(path, s, plan, orig_size, self.finishing_need(jid))
+        if problem and not space_problem(path, s, plan, orig_size):
+            # only short because a file finishing beside it still needs the space: wait for it rather than fail
+            db.x("UPDATE jobs SET message=? WHERE id=?", ("waiting for the file that's finishing to free up space", jid))
+            while self.finishing - {jid} and jid not in self.cancelled:
+                await asyncio.sleep(5)
+            if jid in self.cancelled:
+                return
+            problem = space_problem(path, s, plan, orig_size)
         if problem:
             raise RuntimeError(problem)
         workdir = plan["workdir"]
         os.makedirs(workdir, exist_ok=True)
+        self.peak[jid] = (workdir, plan["tmp"], 2 * expected_output(s, plan.get("codec") or "hevc", orig_size))
         keep = False
         try:
             await self._encode_and_replace(jid, path, s, plan, force, orig_size)
@@ -930,9 +982,25 @@ class Worker:
             keep = bool(plan.get("chunked")) and jid not in self.cancelled
             raise
         finally:
-            self.stage.pop(jid, None)
+            self._close_step(jid)
             if not keep:
                 shutil.rmtree(workdir, ignore_errors=True)
+
+    def finishing_need(self, jid: int) -> int:
+        """Space the jobs still finishing will take before they're done (their final file, which also needs the
+        joined video and the audio/subtitles side by side), so a job starting next to them doesn't use it up."""
+        need = 0
+        for other in self.finishing - {jid}:
+            if other not in self.peak:
+                continue
+            wd, tmp, peak = self.peak[other]
+            on_disk = sum(e.stat().st_size for e in _scandir(wd))
+            try:
+                on_disk += os.path.getsize(tmp)
+            except OSError:
+                pass
+            need += max(0, peak - on_disk)
+        return need
 
     async def _encode_and_replace(self, jid: int, path: str, s: dict, plan: dict, force: bool, orig_size: int):
         state = self._load_state(path, s, plan) if plan.get("chunked") else {}
@@ -1577,9 +1645,17 @@ def expected_output(s: dict, codec: str, orig_size: int) -> int:
     return int(orig_size * max(0.15, min(1.0, 1 - est)))
 
 
-def space_problem(path: str, s: dict, plan: dict, orig_size: int) -> str | None:
+def _scandir(d: str) -> list:
+    try:
+        return [e for e in os.scandir(d) if e.is_file()]
+    except OSError:
+        return []
+
+
+def space_problem(path: str, s: dict, plan: dict, orig_size: int, reserved: int = 0) -> str | None:
     """A transcode writes its work files and the new file next to the source, on the same dataset. At the
-    peak (joined video + audio/subtitles + final file) that's about twice the finished size."""
+    peak (joined video + audio/subtitles + final file) that's about twice the finished size. `reserved`: space
+    a job still finishing next to this one will need."""
     from .organizer import SPACE_MARGIN, free_bytes, gb
     wd = plan.get("workdir") or os.path.dirname(path)
     done = 0
@@ -1589,9 +1665,10 @@ def space_problem(path: str, s: dict, plan: dict, orig_size: int) -> str | None:
         pass
     need = max(0, 2 * expected_output(s, plan.get("codec") or "hevc", orig_size) - done) + SPACE_MARGIN
     free = free_bytes(path)
-    if free is not None and free < need:
+    if free is not None and free < need + reserved:
+        held = f" (another file that's finishing needs {gb(reserved)} more)" if reserved else ""
         return (f"not enough free space on this file's dataset ({os.path.dirname(path)}): about {gb(need)} "
-                f"needed for the work files, {gb(free)} free")
+                f"needed for the work files, {gb(free)} free{held}")
     return None
 
 
