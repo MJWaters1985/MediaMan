@@ -55,12 +55,24 @@ def walk_videos(root: str):
             yield p
 
 
+def same_file(a: str, b: str) -> bool:
+    """Two spellings of one file: on a case-insensitive dataset (usual for SMB shares) "GoodFellas.mkv" exists
+    because "Goodfellas.mkv" does. That's a case-only rename, not a conflict. Only names that differ in case
+    count: a hardlinked import is also the same file as its library copy, and that stays "already in library"."""
+    if os.path.normpath(a).casefold() != os.path.normpath(b).casefold():
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def _status_for(path: str, proposed: str | None) -> str:
     if not proposed:
         return "unknown"
     if os.path.normpath(proposed) == os.path.normpath(path):
         return "ok"
-    if os.path.exists(proposed):
+    if os.path.exists(proposed) and not same_file(path, proposed):
         return "conflict"
     return "proposed"
 
@@ -289,7 +301,7 @@ def apply_item(item_id: int) -> dict:
         if not os.path.exists(src):
             db.x("UPDATE items SET status='error', message='source file missing' WHERE id=?", (item_id,))
             raise ValueError("source file missing")
-        if os.path.exists(dst):
+        if os.path.exists(dst) and not same_file(src, dst):
             if os.path.getsize(dst) == os.path.getsize(src) and item["source"] == "import":
                 db.x("UPDATE items SET status='applied', message='already in library' WHERE id=?", (item_id,))
                 return {"result": "already in library", "path": dst}
@@ -314,7 +326,7 @@ def apply_item(item_id: int) -> dict:
         dst_stem = os.path.splitext(dst)[0]
         for s, suffix in side:
             target = dst_stem + suffix
-            if not os.path.exists(target):
+            if not os.path.exists(target) or same_file(s, target):
                 try:
                     transfer(s, target, mode)
                 except OSError as e:

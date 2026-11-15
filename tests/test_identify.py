@@ -98,3 +98,46 @@ def test_sidecars(tmp_path):
 
 def test_clean_names():
     assert naming.clean('Star Wars: Episode IV / "A New Hope"?') == "Star Wars - Episode IV - A New Hope"
+
+
+def test_file_names_follow_the_folders_capitalisation(tmp_path):
+    """TMDb spells it "GoodFellas"; the library folder is "Goodfellas (1990)". The file keeps the folder's spelling,
+    so no case-only rename (a false conflict on a case-insensitive share) is proposed."""
+    movies, tv = tmp_path / "movies", tmp_path / "tv"
+    (movies / "Goodfellas (1990)").mkdir(parents=True)
+    (tv / "Mythbusters (2003)").mkdir(parents=True)
+    info = {"type": "movie", "title": "GoodFellas", "year": 1990}
+    assert naming.build_path(info, ".mkv", str(movies), str(tv)) == \
+        str(movies / "Goodfellas (1990)" / "Goodfellas (1990).mkv")
+    show = {"type": "episode", "title": "MythBusters", "year": 2003, "season": 1, "episodes": [2]}
+    assert naming.build_path(show, ".mkv", str(movies), str(tv)) == \
+        str(tv / "Mythbusters (2003)" / "Season 01" / "Mythbusters S01E02.mkv")
+    other = {"type": "movie", "title": "Spider-Man", "year": 2002}       # spelled differently, not just case
+    (movies / "Spider Man (2002)").mkdir()
+    assert naming.build_path(other, ".mkv", str(movies), str(tv)).endswith("/Spider-Man (2002).mkv")
+
+
+def test_case_only_rename_is_not_a_conflict(tmp_path, monkeypatch):
+    from app import organizer
+    a = tmp_path / "Goodfellas (1990).mkv"
+    a.write_bytes(b"x")
+    b = str(tmp_path / "GoodFellas (1990).mkv")
+    real_exists, real_same = os.path.exists, os.path.samefile
+
+    def ci_exists(p):                         # a case-insensitive dataset, as on an SMB share
+        return real_exists(p) or (p.casefold() == str(a).casefold() and real_exists(a))
+
+    def ci_same(x, y):
+        x, y = (str(a) if p.casefold() == str(a).casefold() else p for p in (x, y))
+        return real_same(x, y)
+    monkeypatch.setattr(organizer.os.path, "exists", ci_exists)
+    monkeypatch.setattr(organizer.os.path, "samefile", ci_same)
+    assert organizer.same_file(str(a), b)
+    assert organizer._status_for(str(a), b) == "proposed"
+    c = tmp_path / "Other.mkv"
+    c.write_bytes(b"y")
+    assert organizer._status_for(str(c), b) == "conflict"   # a different file really is in the way
+    monkeypatch.undo()
+    link = tmp_path / "Linked.mkv"                          # a hardlinked import is not a case-only rename
+    os.link(a, link)
+    assert not organizer.same_file(str(a), str(link))

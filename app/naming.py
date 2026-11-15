@@ -65,6 +65,14 @@ def find_existing_folder(root: str, title: str, year: int | None) -> str | None:
     return best
 
 
+def spelled_like(title: str, folder: str) -> str:
+    """The title for file names inside an existing library folder: the folder's own spelling when the two differ
+    only in capitalisation (a "Goodfellas" folder keeps "Goodfellas (1990).mkv" though TMDb says "GoodFellas"),
+    so files match their folder and a case-only rename is never proposed."""
+    have = parse_folder_name(folder).get("title") or ""
+    return clean(have) if have and clean(have).casefold() == clean(title).casefold() else clean(title)
+
+
 def series_folder(info: dict, tv_root: str, include_ids: bool) -> str:
     existing = find_existing_folder(tv_root, info["title"], info.get("year"))
     if existing:
@@ -120,7 +128,7 @@ def build_path(info: dict, ext: str, movies_root, tv_root, include_ids: bool = T
         return None
     if info["type"] == "movie":
         folder = movie_folder(info, movies_root, include_ids)
-        base = clean(info["title"]) + (f" ({info['year']})" if info.get("year") else "")
+        base = spelled_like(info["title"], folder) + (f" ({info['year']})" if info.get("year") else "")
         if info.get("edition"):
             base += f" - {clean(info['edition'])}"
         if info.get("part"):
@@ -128,7 +136,7 @@ def build_path(info: dict, ext: str, movies_root, tv_root, include_ids: bool = T
         return os.path.join(movies_root, folder, base + ext)
 
     folder = series_folder(info, tv_root, include_ids)
-    series = clean(info["title"])
+    series = spelled_like(info["title"], folder)
     if info.get("date") and not info.get("episodes"):
         d = str(info["date"])[:10]
         return os.path.join(tv_root, folder, f"Season {d[:4]}", f"{series} {d}{ext}")

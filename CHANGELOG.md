@@ -2,6 +2,14 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.8.6 — 2026-11-14
+
+- Fixed: a false *conflict* in the library when TMDb capitalises a title differently from your folder (TMDb's
+  "GoodFellas" in a "Goodfellas (1990)" folder). Inside an existing folder, file names now follow the folder's
+  spelling when the two differ only in capitalisation. And on a case-insensitive dataset (usual for SMB
+  shares) a rename that only changes capitalisation is done as a rename instead of being reported as
+  *destination exists*. A hardlinked import is still recognised as already in the library.
+
 ## 1.8.5 — 2026-11-13
 
 - The next file starts encoding as soon as the current one's encoding is done, instead of waiting through
