@@ -782,6 +782,12 @@ class Worker:
         st["started"], st["entered"] = time.time(), False
         db.x("UPDATE jobs SET steps=? WHERE id=?", (db.jdump(t), jid))
 
+    def save_step_times(self):
+        """Save the time running jobs have spent in their current step. Called at shutdown: uvicorn ends the
+        process right after the app's shutdown event, so the jobs' own cleanup never runs."""
+        for jid in list(self.stage):
+            self._close_step(jid)
+
     def _enter(self, jid: int, name: str, detail: str | None = None, progress: float | None = None):
         self._close_step(jid)
         steps = (self.stage.get(jid) or {}).get("steps") or []

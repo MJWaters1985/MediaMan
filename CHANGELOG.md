@@ -2,6 +2,12 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.8.8 — 2026-11-17
+
+- Fixed: a restart or app update lost the time a running job had spent in its current step, so a job
+  interrupted mid-encode showed no encoding time from before the restart. The step times of running jobs
+  are now saved when MediaMan is stopped.
+
 ## 1.8.7 — 2026-11-17
 
 - Fixed: a job that resumed mid-encode after a restart or update recorded no time for its *Encoding* step,

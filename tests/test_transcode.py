@@ -457,6 +457,19 @@ def test_a_resumed_encode_is_timed(monkeypatch):
     assert db.jload(db.one("SELECT steps FROM jobs WHERE id=?", (jid,))["steps"]) == {"Encoding": 300.0}
 
 
+def test_shutdown_saves_the_current_step_time(monkeypatch):
+    from app import db
+    clock = [1000.0]
+    monkeypatch.setattr(transcode.time, "time", lambda: clock[0])
+    jid = db.x("INSERT INTO jobs(path,status) VALUES(?,?)", ("/x/stopped.mkv", "running"))
+    w = transcode.Worker()
+    w._steps(jid, ["Encoding", "Final file"])
+    w._enter(jid, "Encoding")
+    clock[0] += 7200
+    w.save_step_times()                           # the app's shutdown event
+    assert db.jload(db.one("SELECT steps FROM jobs WHERE id=?", (jid,))["steps"]) == {"Encoding": 7200.0}
+
+
 def test_space_for_a_finishing_file_is_kept_free(tmp_path, monkeypatch):
     from app import organizer
     w = transcode.Worker()

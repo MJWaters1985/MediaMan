@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth, config, db, fsbrowse, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.8.7"
+VERSION = "1.8.8"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="MediaMan", version=VERSION)
@@ -68,6 +68,11 @@ async def startup():
     if tls.state["error"]:
         db.log("error", "tls", f"HTTPS requested but {tls.state['error']} — serving plain HTTP")
     asyncio.create_task(tls.watch_for_renewal(_busy, db.log, int(os.environ.get("MEDIAMAN_TLS_CHECK_SECONDS", "300"))))
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    transcode.worker.save_step_times()
 
 
 async def _housekeeping_loop():
