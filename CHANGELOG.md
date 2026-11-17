@@ -2,6 +2,13 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.8.7 — 2026-11-17
+
+- Fixed: a job that resumed mid-encode after a restart or update recorded no time for its *Encoding* step,
+  so its step times left the encode out. Jobs that start fresh were not affected.
+- The end-to-end check no longer fails now and then when its short test file finishes encoding before
+  the check gets to interrupt it.
+
 ## 1.8.6 — 2026-11-14
 
 - Fixed: a false *conflict* in the library when TMDb capitalises a title differently from your folder (TMDb's

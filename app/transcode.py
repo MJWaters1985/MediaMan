@@ -793,6 +793,15 @@ class Worker:
             self.finishing.add(jid)
         db.x("UPDATE jobs SET message=? WHERE id=?", (detail or name, jid))
 
+    def _enter_once(self, jid: int, name: str, detail: str | None = None):
+        """Enter a step unless the job is already timing it (each chunk of an encode only updates the detail).
+        A resumed job's first step is set by _steps without being entered, so it still gets entered here."""
+        st = self.stage.get(jid) or {}
+        if st.get("name") == name and st.get("entered"):
+            self._detail(jid, detail)
+        else:
+            self._enter(jid, name, detail)
+
     def _detail(self, jid: int, detail: str | None = None, progress: float | None = None):
         st = self.stage.get(jid)
         if st is not None:
@@ -1189,10 +1198,7 @@ class Worker:
                 k = len(chunks)
                 out = os.path.join(wd, f"c{k:05d}{ext}")
                 msg = f"{plan['reason']} via cpu ({ENCODERS['software'][codec]}) — chunk {k + 1} of {total_chunks}"
-                if (self.stage.get(jid) or {}).get("name") != "Encoding":
-                    self._enter(jid, "Encoding", msg)
-                else:
-                    self._detail(jid, msg)
+                self._enter_once(jid, "Encoding", msg)
                 for retry in range(3):
                     self.last.pop(jid, None)
                     ok, err = await self._ffmpeg(jid, chunk_command(path, out + ".part", s, codec, crf, done, n_per),

@@ -443,6 +443,20 @@ def test_step_times_are_kept_across_a_restart(monkeypatch):
     assert jid in w2.finishing and jid not in w.finishing
 
 
+def test_a_resumed_encode_is_timed(monkeypatch):
+    from app import db
+    clock = [1000.0]
+    monkeypatch.setattr(transcode.time, "time", lambda: clock[0])
+    jid = db.x("INSERT INTO jobs(path,status) VALUES(?,?)", ("/x/resumed.mkv", "running"))
+    w = transcode.Worker()
+    w._steps(jid, ["Encoding", "Joining chunks"])  # resumed: Encoding is the first step, not yet entered
+    for _ in range(3):                             # one call per chunk
+        w._enter_once(jid, "Encoding", "chunk")
+        clock[0] += 100
+    w._enter(jid, "Joining chunks")
+    assert db.jload(db.one("SELECT steps FROM jobs WHERE id=?", (jid,))["steps"]) == {"Encoding": 300.0}
+
+
 def test_space_for_a_finishing_file_is_kept_free(tmp_path, monkeypatch):
     from app import organizer
     w = transcode.Worker()

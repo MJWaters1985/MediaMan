@@ -66,14 +66,16 @@ async def run_job(path, cancel_after_chunks=None):
     if cancel_after_chunks:
         wd = None
         while not task.done():
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.05)
             plan = db.jload(db.one("SELECT plan FROM jobs WHERE id=?", (jid,))["plan"]) or {}
             wd = plan.get("workdir")
-            if wd and os.path.exists(os.path.join(wd, "state.json")):
-                st = json.load(open(os.path.join(wd, "state.json")))
-                if len(st.get("chunks", [])) >= cancel_after_chunks:
-                    task.cancel()      # what a server shutdown does
-                    break
+            try:        # the job may finish (and remove its work folder) between two looks
+                st = json.load(open(os.path.join(wd, "state.json"))) if wd else {}
+            except (OSError, ValueError):
+                st = {}
+            if len(st.get("chunks", [])) >= cancel_after_chunks:
+                task.cancel()      # what a server shutdown does
+                break
         try:
             await task
         except asyncio.CancelledError:
@@ -103,8 +105,8 @@ async def main():
 
         # 1) interrupted after 2 chunks, like a restart
         jid, wd = await run_job(src, cancel_after_chunks=2)
-        if not wd:
-            print(db.one("SELECT status, message FROM jobs WHERE id=?", (jid,))); fails.append("job"); continue
+        if not wd or not os.path.exists(os.path.join(wd, "state.json")):
+            print("finished before it could be interrupted:", db.one("SELECT status, message FROM jobs WHERE id=?", (jid,))); fails.append("job"); continue
         st = json.load(open(os.path.join(wd, "state.json")))
         check(f"{codec}: work kept after shutdown", len(st["chunks"]) >= 2 and os.path.exists(src), f"chunks={st['chunks']}")
         db.x("UPDATE jobs SET status='queued' WHERE id=?", (jid,))
