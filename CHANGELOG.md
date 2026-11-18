@@ -2,6 +2,19 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.9.0 — 2026-11-17
+
+- Files that won't save enough are now skipped early instead of after a whole encode. Grainy older films
+  often need a low CRF to reach the quality target and end up barely smaller, which used to cost 5–15
+  hours each before the final size check threw the result away. MediaMan now predicts the size twice:
+  after the quality search, from how much its samples shrank at the chosen CRF, and during a chunked
+  encode, from the finished chunks against the exact source bytes they came from. A file is skipped only
+  when the prediction misses the minimum saving by a margin (3 points after the search, narrowing from
+  about 3.5 to half a point as the encode goes on), so borderline files still get the exact check. Early
+  skips are reported and remembered like other skips; Force turns the predictions off.
+- The job's size estimate now comes from the quality search instead of the source bitrate, which
+  claimed about 90% for nearly every 4K film. The Log tab shows each prediction.
+
 ## 1.8.8 — 2026-11-17
 
 - Fixed: a restart or app update lost the time a running job had spent in its current step, so a job

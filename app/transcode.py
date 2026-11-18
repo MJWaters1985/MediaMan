@@ -1030,6 +1030,7 @@ class Worker:
                 (["Audio and subtitles"] if chunked else []) + (["Final file"] if chunked or js or dv else []) + \
                 ["Checking the result"]
         self._steps(jid, names)
+        plan["force"] = force
         src_size = os.path.getsize(path)
         if js and not os.path.exists(js):
             self._enter(jid, "Reading HDR10+ metadata", "reading the HDR10+ metadata from the whole film")
@@ -1045,12 +1046,24 @@ class Worker:
             db.x("UPDATE jobs SET plan=? WHERE id=?", (db.jdump(plan | {"force": force}), jid))
         elif plan.get("search"):
             self._enter(jid, "Quality search", "cutting sample clips")
-            crf, score, tried = await self._crf_search(jid, path, s, plan)
+            crf, score, tried, ratio = await self._crf_search(jid, path, s, plan)
             if jid in self.cancelled:
                 return
             plan = await asyncio.to_thread(make_plan, path, s, force, crf)
             plan["vmaf"] = {"crf": crf, "score": score, "tried": tried, "target": float(config.get("vmaf_target"))}
+            if ratio is not None:
+                saving = predicted_saving(orig_size, source_video_bytes(s, orig_size), ratio)
+                plan["vmaf"]["ratio"] = round(ratio, 4)
+                plan["predicted_saving"] = round(saving, 4)
+                plan["reason"] = re.sub(r" \(~-?\d+% smaller\)", "", plan["reason"]) + \
+                    f" (~{max(0, saving) * 100:.0f}% smaller)"
+                db.log("info", "transcode", f"{os.path.basename(path)}: quality search chose CRF {crf} "
+                                            f"(VMAF {score:.1f}); its samples predict ~{saving * 100:.0f}% smaller")
             db.x("UPDATE jobs SET plan=? WHERE id=?", (db.jdump(plan | {"force": force}), jid))
+            if ratio is not None and not force:
+                why = early_skip_reason(saving, EARLY_MARGIN_SEARCH, "from the quality search")
+                if why:
+                    return self._skip_early(jid, path, why)
         tmp = plan["tmp"]
         if plan.get("chunked"):
             if not await self._encode_chunked(jid, path, s, plan, state):
@@ -1170,15 +1183,18 @@ class Worker:
             self._enter(jid, "Counting frames", "reading the whole film to count its frames exactly")
             # packets in the whole file, minus frames the decoder discards at the very start (a file cut on an
             # open GOP begins with frames that reference the missing previous GOP)
-            cnt, head = os.path.join(wd, "frames.txt"), os.path.join(wd, "head.txt")
+            cnt, head = os.path.join(wd, PACKETS_FILE), os.path.join(wd, "head.txt")
             fp = q(probe.FFPROBE)
-            ok, err = await self._sh(jid, f"{fp} -v error -select_streams V:0 -count_packets "
-                                          f"-show_entries stream=nb_read_packets -of csv=p=0 {q(path)} > {q(cnt)} && "
+            # one line per video packet with its size: the count, and the source bytes behind each chunk
+            ok, err = await self._sh(jid, f"{fp} -v error -select_streams V:0 "
+                                          f"-show_entries packet=size -of csv=p=0 {q(path)} > {q(cnt)} && "
                                           f"{fp} -v error -select_streams V:0 -read_intervals %+10 -count_packets "
                                           f"-count_frames -show_entries stream=nb_read_packets,nb_read_frames "
                                           f"-of json {q(path)} > {q(head)}", read_total=os.path.getsize(path))
             try:
-                total = int(open(cnt).read().strip().strip(",").split()[0])
+                total = len(read_packet_sizes(cnt))
+                if not total:
+                    raise ValueError("no packets")
                 h = json.load(open(head))["streams"][0]
                 state["src_frames"] = total - max(0, int(h["nb_read_packets"]) - int(h["nb_read_frames"]))
             except (OSError, ValueError, IndexError, KeyError):
@@ -1188,6 +1204,10 @@ class Worker:
         expected = state["src_frames"]
         dur = expected / fps
         total_chunks = max(1, -(-expected // n_per))
+        packets = [] if plan.get("force") else read_packet_sizes(os.path.join(wd, PACKETS_FILE))
+        prefix = [0]
+        for p in packets:
+            prefix.append(prefix[-1] + p)
         state.update(crf=crf, vmaf=plan.get("vmaf"))
         state.setdefault("chunks", [])
         self._save_state(wd, state)
@@ -1228,6 +1248,10 @@ class Worker:
                 self._save_state(wd, state)
                 if got < n_per:
                     break
+                if len(prefix) > 1:
+                    why = self._chunk_check(jid, path, wd, ext, chunks, done, expected, prefix, plan)
+                    if why:
+                        return self._skip_early(jid, path, why)
             if not chunks:
                 raise RuntimeError("the encoder produced no video")
             self._enter(jid, "Joining chunks", f"joining {len(chunks)} chunks into one video stream")
@@ -1282,6 +1306,33 @@ class Worker:
     @staticmethod
     def _fail(msg: str):
         raise RuntimeError(msg)
+
+    def _chunk_check(self, jid: int, path: str, wd: str, ext: str, chunks: list, done: int, expected: int,
+                     prefix: list, plan: dict) -> str | None:
+        """Project the finished file's size from the chunks encoded so far (their bytes against the source
+        bytes they came from); a skip message when it clearly won't save enough."""
+        share = done / max(expected, 1)
+        if share < EARLY_FIRST_CHECK or len(chunks) < 2:
+            return None
+        src = prefix[min(done, len(prefix) - 1)]
+        if src <= 0:
+            return None
+        enc = sum(e.stat().st_size for e in _scandir(wd) if re.fullmatch(r"c\d{5}" + re.escape(ext), e.name))
+        orig_size = os.path.getsize(path)
+        saving = predicted_saving(orig_size, prefix[-1], enc / src)
+        n = len(chunks)
+        if n == 2 or n % 10 == 0:
+            db.log("info", "transcode", f"{os.path.basename(path)}: after {share * 100:.0f}% of the film the "
+                                        f"chunks project ~{saving * 100:.0f}% smaller")
+        return early_skip_reason(saving, chunk_margin(share), f"after encoding {share * 100:.0f}% of the film")
+
+    def _skip_early(self, jid: int, path: str, msg: str) -> bool:
+        """Stop a transcode that won't save enough, like a finished one that didn't (the work folder goes)."""
+        remember_skip(path, msg)
+        db.x("UPDATE jobs SET status='skipped', progress=1, new_size=NULL, eta=NULL, finished=?, message=? "
+             "WHERE id=?", (time.time(), msg, jid))
+        db.log("info", "transcode", f"{os.path.basename(path)}: {msg}")
+        return False
 
     def _replace(self, path: str, tmp: str, final: str) -> str:
         if os.path.normpath(final) != os.path.normpath(path) and os.path.exists(final):
@@ -1425,8 +1476,9 @@ class Worker:
             return False if jid in self.cancelled else self._fail(f"adding the Dolby Vision metadata failed: {err_summary(err)}")
         return True
 
-    async def _crf_search(self, jid: int, path: str, s: dict, plan: dict) -> tuple[int, float, dict]:
-        """Find the highest CRF whose sample encodes still reach the VMAF target (binary search)."""
+    async def _crf_search(self, jid: int, path: str, s: dict, plan: dict) -> tuple[int, float, dict, float | None]:
+        """Find the highest CRF whose sample encodes still reach the VMAF target (binary search). Also returns
+        how much the samples' video shrank at that CRF (encoded bytes / source bytes), or None."""
         codec, wd = plan["codec"], plan["workdir"]
         target = float(config.get("vmaf_target") or 95)
         dur = s.get("duration") or 0
@@ -1446,6 +1498,8 @@ class Worker:
         threads = limits()["cpus"]
         enc = _software_args(codec, 10, 0, s, full=False)
         tried: dict[int, float] = {}
+        sizes: dict[int, int] = {}       # CRF → total bytes of its sample encodes
+        ref_bytes = sum(os.path.getsize(sp) for sp in samples)
         ff = shlex.quote(probe.FFMPEG)
         lo0, hi0 = crf_range(codec, s)
         tests = max(1, math.ceil(math.log2(hi0 - lo0 + 2)))      # a binary search over the CRF range
@@ -1457,6 +1511,7 @@ class Worker:
             args[args.index("-crf") + 1] = str(crf)
             vals = []
             done = len(tried)
+            sizes[crf] = 0
             for i, sp in enumerate(samples):
                 self._detail(jid, f"testing CRF {crf} (test {done + 1} of about {tests}) — sample {i + 1} of {len(samples)}",
                              min(0.99, (done + i / len(samples)) / tests))
@@ -1466,6 +1521,7 @@ class Worker:
                                               f"{shlex.quote(dist)}")
                 if not ok:
                     raise RuntimeError(f"sample encode failed at CRF {crf}: {err_summary(err)}")
+                sizes[crf] += os.path.getsize(dist)
                 r, d, js = (os.path.join(wd, x) for x in ("r.y4m", "d.y4m", "vmaf.json"))
                 for fifo in (r, d):
                     if os.path.exists(fifo):
@@ -1498,7 +1554,8 @@ class Worker:
                 hi = mid - 1
         if best is None:
             best = crf_range(codec, s)[0]
-        return best, tried.get(best, 0.0), {str(k): v for k, v in sorted(tried.items())}
+        ratio = sizes[best] / ref_bytes if best in sizes and ref_bytes else None
+        return best, tried.get(best, 0.0), {str(k): v for k, v in sorted(tried.items())}, ratio
 
     async def _ffmpeg(self, jid: int, cmd: list[str], duration: float, offset: float = 0.0) -> tuple[bool, str]:
         """offset: seconds of the title already encoded (chunked jobs), so progress and ETA cover the whole film."""
@@ -1584,6 +1641,7 @@ class Worker:
 
 
 WORK_SUFFIX = ".mediaman-work"
+PACKETS_FILE = "packets.txt"      # in the work folder: the source's video packet sizes, one per line
 ORPHAN_AGE = 2 * 86400      # a work folder untouched this long with no job waiting for it is removed
 
 
@@ -1655,6 +1713,57 @@ def expected_output(s: dict, codec: str, orig_size: int) -> int:
     tgt_bpp = {"hevc": 0.06, "av1": 0.045, "h264": 0.085}.get(codec, 0.06) * (0.6 if s.get("height", 0) > 1800 else 1)
     est = 1 - (tgt_bpp / bpp) if bpp else 0.5
     return int(orig_size * max(0.15, min(1.0, 1 - est)))
+
+
+# A file is skipped before it's fully encoded only when its predicted saving misses the minimum by this
+# margin: wide after the quality search's few seconds of samples, narrowing as more of the film is encoded.
+EARLY_MARGIN_SEARCH = 0.03
+EARLY_MARGIN_CHUNKS = (0.005, 0.035)     # (margin at the end, extra margin at the start), shrinking linearly
+EARLY_FIRST_CHECK = 0.05                 # chunked encodes are first projected after this share of the film
+
+
+def source_video_bytes(s: dict, orig_size: int) -> int:
+    """The source's video stream size from its bitrate. When the bitrate is unknown it counts the whole file
+    as video, which predicts the biggest possible saving, so an unknown bitrate never causes a skip."""
+    vb = (s.get("vbitrate") or 0) * (s.get("vduration") or s.get("duration") or 0) / 8
+    return int(min(orig_size, vb)) if vb > 0 else orig_size
+
+
+def predicted_saving(orig_size: int, video_bytes: int, ratio: float) -> float:
+    """Share of the file the transcode saves when the video shrinks to `ratio` of its size and everything
+    else (audio, subtitles, chapters) is copied as-is."""
+    if orig_size <= 0:
+        return 0.0
+    video_bytes = min(max(video_bytes, 0), orig_size)
+    return 1 - (orig_size - video_bytes + video_bytes * ratio) / orig_size
+
+
+def early_skip_reason(saving: float, margin: float, basis: str) -> str | None:
+    """A skip message when the predicted saving falls clearly short of the minimum, else None."""
+    min_save = float(config.get("min_savings_pct") or 0) / 100
+    if min_save <= 0 or saving >= min_save - margin:
+        return None
+    what = f"predicted only {saving * 100:.0f}% smaller" if saving > 0.005 else "predicted not to get smaller"
+    return f"{what} ({basis}) — kept original"
+
+
+def chunk_margin(share_done: float) -> float:
+    end, extra = EARLY_MARGIN_CHUNKS
+    return end + extra * max(0.0, 1 - share_done)
+
+
+def read_packet_sizes(path: str) -> list[int]:
+    """ffprobe's per-packet sizes (one per line, as written by the frame count), or [] when unavailable."""
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip().strip(",")
+                if line:
+                    out.append(int(line))
+    except (OSError, ValueError):
+        return []
+    return out
 
 
 def _scandir(d: str) -> list:

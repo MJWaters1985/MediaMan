@@ -107,6 +107,22 @@ replaces the original under the same name (non-MKV sources become `.mkv`). The o
 deleted, or moved to `.mediaman-trash` when *Keep originals* is on. Files in the downloads folder
 are never transcoded.
 
+**Skipping files that won't save enough, early:** the size check above normally comes at the end, so a
+film that only shrinks 10% would cost a whole encode. Grainy older films are the usual case: they need a
+low CRF to reach the quality target, and the result stays big. MediaMan predicts the size twice before
+that:
+
+- after the quality search, from how much its samples shrank at the chosen CRF (audio, subtitles and
+  chapters are copied unchanged, so only the video counts). The Log tab shows the prediction.
+- while a chunked encode runs, from the finished chunks against the exact source bytes they came from,
+  first after 5% of the film and then after every chunk.
+
+A file is skipped only when the prediction misses `min savings` by a margin: 3 percentage points after
+the quality search, and from about 3.5 points down to half a point as more of the film is encoded. A
+borderline file still encodes to the end and gets the exact check. An early skip is reported like any
+other (*predicted only 9% smaller (from the quality search) — kept original*) and remembered, so the
+file isn't queued again until it changes; **Force** transcodes it anyway, without the predictions.
+
 **Performance note:** x265's automatic NUMA thread-pool setup fails inside Docker, which disables
 its thread pool and wavefront parallelism. MediaMan passes `pools=<cpu count>` explicitly, which is
 about 3.4× faster on a 24-thread Ryzen.

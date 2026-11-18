@@ -519,3 +519,69 @@ def test_a_file_waits_for_space_a_finishing_file_holds(tmp_path, monkeypatch):
         await asyncio.wait_for(task, 10)
     asyncio.run(go())
     assert ran
+
+
+def test_predicted_saving_counts_only_the_video():
+    # an 80 GB file with 60 GB of video: video at 25% of its size → 45 GB saved
+    assert round(transcode.predicted_saving(80, 60, 0.25), 4) == round(45 / 80, 4)
+    assert transcode.predicted_saving(80, 60, 1.0) == 0.0
+    assert transcode.predicted_saving(80, 100, 0.5) == 0.5           # never more video than file
+    s = S(vbitrate=8_000_000, duration=1000)
+    assert transcode.source_video_bytes(s, 10 ** 10) == 10 ** 9
+    assert transcode.source_video_bytes(S(), 12345) == 12345         # bitrate unknown: assume all video
+
+
+def test_early_skip_only_when_clearly_short():
+    config.update({"min_savings_pct": 15})
+    assert transcode.early_skip_reason(0.20, 0.03, "x") is None
+    assert transcode.early_skip_reason(0.13, 0.03, "x") is None      # within the margin: encode and see
+    why = transcode.early_skip_reason(0.07, 0.03, "from the quality search")
+    assert why == "predicted only 7% smaller (from the quality search) — kept original"
+    assert "not to get smaller" in transcode.early_skip_reason(-0.02, 0.03, "x")
+    config.update({"min_savings_pct": 0})
+    assert transcode.early_skip_reason(-0.5, 0.03, "x") is None      # no minimum, no early skips
+    config.update({"min_savings_pct": 15})
+    assert transcode.chunk_margin(0.05) > transcode.chunk_margin(0.5) > transcode.chunk_margin(1.0) > 0
+
+
+def test_packet_sizes_are_read_from_ffprobe_output(tmp_path):
+    f = tmp_path / "packets.txt"
+    f.write_text("100,\n200\n\n300\n")
+    assert transcode.read_packet_sizes(str(f)) == [100, 200, 300]
+    assert transcode.read_packet_sizes(str(tmp_path / "missing.txt")) == []
+
+
+def test_chunks_project_the_final_size(tmp_path):
+    from app import db
+    config.update({"min_savings_pct": 15})
+    src = tmp_path / "Film.mkv"
+    src.write_bytes(b"x" * 1000)                       # 1000 bytes, 800 of them video
+    wd = tmp_path / ".Film.mediaman-work"
+    wd.mkdir()
+    prefix = [0]
+    for _ in range(100):                               # 100 frames of 8 bytes
+        prefix.append(prefix[-1] + 8)
+    w = transcode.Worker()
+    jid = db.x("INSERT INTO jobs(path,status) VALUES(?,?)", (str(src), "running"))
+    plan = {}
+    (wd / "c00000.hevc").write_bytes(b"y" * 76)        # 10 frames: 80 source bytes → 76 (95%)
+    assert w._chunk_check(jid, str(src), str(wd), ".hevc", [10], 10, 100, prefix, plan) is None  # one chunk
+    (wd / "c00001.hevc").write_bytes(b"y" * 76)
+    (wd / "c00002.hevc.part").write_bytes(b"y" * 500)  # the chunk being written doesn't count
+    why = w._chunk_check(jid, str(src), str(wd), ".hevc", [10, 10], 20, 100, prefix, plan)
+    assert why and why.startswith("predicted only 4% smaller (after encoding 20% of the film)")
+    for name in ("c00000.hevc", "c00001.hevc"):
+        (wd / name).write_bytes(b"y" * 30)             # 37.5%: ~50% smaller
+    assert w._chunk_check(jid, str(src), str(wd), ".hevc", [10, 10], 20, 100, prefix, plan) is None
+    assert w._chunk_check(jid, str(src), str(wd), ".hevc", [2, 2], 4, 100, prefix, plan) is None  # under 5%
+
+
+def test_an_early_skip_is_remembered(tmp_path):
+    from app import db
+    src = tmp_path / "Grainy.mkv"
+    src.write_bytes(b"x" * 10)
+    jid = db.x("INSERT INTO jobs(path,status) VALUES(?,?)", (str(src), "running"))
+    assert transcode.Worker()._skip_early(jid, str(src), "predicted only 5% smaller (x) — kept original") is False
+    row = db.one("SELECT status, message, progress FROM jobs WHERE id=?", (jid,))
+    assert row["status"] == "skipped" and row["progress"] == 1 and row["message"].startswith("predicted only 5%")
+    assert transcode.skipped_before(str(src)).startswith("predicted only 5%")
