@@ -261,6 +261,37 @@ themselves. MediaMan does the same: it fetches the missing certificates from the
 Jellyfin's certificate, keeps them in the config folder, and still requires the chain to end at a
 trusted root.
 
+### Its own IP address, DNS name and port 443
+
+To reach MediaMan at `https://mediaman.example.com` with no port number, give the catalog app a LAN
+address of its own. Everything is in the TrueNAS web interface; the example uses `192.0.2.4` for the
+NAS and `192.0.2.50` for MediaMan.
+
+1. **Free port 443.** The TrueNAS web interface listens on every address by default, which blocks 443
+   on any new one. In **System → General Settings → GUI → Settings**, set **Web Interface IPv4
+   Address** to the NAS's main address (`192.0.2.4`) only. Pick the address you reach TrueNAS on
+   now, or you'll lose the web interface until you fix it from the console.
+2. **Add an alias IP.** In **Network → Interfaces**, edit the LAN interface and add `192.0.2.50` (with
+   the same netmask as the main address, e.g. `/24`) under **Aliases**. Pick an address outside your
+   router's DHCP range. Click **Test Changes**, then **Save Changes** within the time it shows;
+   otherwise TrueNAS undoes the change by itself.
+3. **Bind MediaMan to it.** Edit the app: under **WebUI Port**, keep **Port Bind Mode** at *Publish*,
+   set **Port Number** to `443`, and add `192.0.2.50` under **Host IPs**. Without a Host IP the app
+   would claim 443 on every address and fail to start next to the TrueNAS web interface.
+4. **Add a DNS record** pointing `mediaman.example.com` at `192.0.2.50`, e.g. a host override in your
+   router's or LAN's DNS resolver.
+5. **Use a certificate for that name.** The certificate has to cover `mediaman.example.com`, or
+   browsers will warn. In **Credentials → Certificates**, create one with an ACME DNS authenticator, or
+   import one from your own tool, and pick it under the app's **Certificate**. If your tool imports
+   each renewal as a new certificate, it also has to point the app at the new one.
+
+Saving the app restarts MediaMan; a chunked encode resumes at the chunk it was on. Check with
+`https://mediaman.example.com/healthz`, which answers `{"ok":true}`. To undo, set **Port Number**
+back to `30579` and clear **Host IPs**.
+
+Use an alias IP rather than a macvlan network: Docker blocks traffic between the host and a macvlan
+container, which would cut MediaMan off from Jellyfin and qBittorrent running on the same NAS.
+
 ### Permissions
 
 The container runs as `568:568` (TrueNAS's `apps` user, the same user the Jellyfin and qBittorrent
