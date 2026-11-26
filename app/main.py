@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import threading
 import time
 from urllib.parse import urlsplit
@@ -13,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth, config, db, fsbrowse, integrations, organizer, probe, tls, transcode, watcher
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 
 app = FastAPI(title="MediaMan", version=VERSION)
@@ -199,8 +200,12 @@ async def redetect():
 
 
 # ---------------------------------------------------------------- library items
+OLD_GUESS = re.compile(r" \(~-?\d+% smaller\)")    # stored by versions before 1.10 until the next scan
+
+
 def _item_out(r: dict) -> dict:
     r = dict(r)
+    r["transcode_hint"] = OLD_GUESS.sub("", r.get("transcode_hint") or "") or r.get("transcode_hint")
     r["info"] = db.jload(r["info"]) or {}
     k = db.one("SELECT size, reason FROM transcode_skips WHERE path=?", (r["path"],))
     r["skipped"] = k["reason"] if k and k["size"] == r["size"] else None
@@ -338,9 +343,14 @@ def list_jobs(status: str = "", limit: int = 300):
         rows = db.q("SELECT * FROM jobs WHERE status IN (%s) ORDER BY id DESC LIMIT ?" % ",".join("?" * len(status.split(","))),
                     status.split(",") + [limit])
     else:
-        rows = db.q("""SELECT * FROM jobs ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'paused' THEN 1
-                       WHEN 'queued' THEN 2 ELSE 3 END, CASE WHEN status='queued' THEN -priority ELSE 0 END,
-                       CASE WHEN status IN ('queued') THEN id ELSE -COALESCE(finished, id) END LIMIT ?""", (limit,))
+        # running, paused, the queue in the order it will run, then the most recently finished
+        active = db.q("""SELECT * FROM jobs WHERE status IN ('running','paused')
+                         ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, id""")
+        queued = db.q("SELECT * FROM jobs WHERE status='queued' ORDER BY " + transcode.queue_order_sql() + " LIMIT ?",
+                      (limit,))
+        rest = db.q("""SELECT * FROM jobs WHERE status NOT IN ('running','paused','queued')
+                       ORDER BY COALESCE(finished, id) DESC LIMIT ?""", (limit,))
+        rows = (active + queued + rest)[:limit]
     for r in rows:
         p = db.jload(r["plan"]) or {}
         r["backend"], r["codec"], r["reason"] = p.get("backend"), p.get("codec"), p.get("reason")

@@ -115,7 +115,8 @@ that:
 - after the quality search, from how much its samples shrank at the chosen CRF (audio, subtitles and
   chapters are copied unchanged, so only the video counts). The Log tab shows the prediction.
 - while a chunked encode runs, from the finished chunks against the exact source bytes they came from,
-  first after 5% of the film and then after every chunk.
+  first after 5% of the film and then after every chunk. The Log tab shows the first projection and
+  then only changes of 3 points or more.
 
 A file is skipped only when the prediction misses `min savings` by a margin: 3 percentage points after
 the quality search, and from about 3.5 points down to half a point as more of the film is encoded. A
@@ -151,6 +152,13 @@ default, Settings → Transcoding), the next file in the queue starts meanwhile.
 have at most one file finishing beside it, and the free-space check for the new file counts the space
 the finishing file still needs. Each finished job shows how long its steps took (*Time: Quality search
 · Encoding · …*), kept across restarts.
+
+**Queue order:** by default files are transcoded in the order they were queued. With **Queue order** set
+to *savings* (Settings → Transcoding), the files that free the most space per hour go first: files headed
+for AV1 before those that need HEVC (Dolby Vision and HDR10+), because on the CPU an AV1 encode saves about
+three times as many GB per hour, and the biggest files first within each group. New imports are ranked
+from the assessment made when they were imported; files nothing has assessed yet go in between. A job's own priority still comes first. It
+changes when the space comes back, not how long the whole queue takes.
 
 **Restarts and shutdowns:** stopping the app, restarting the app pool or shutting down the NAS sends
 MediaMan the normal container stop signal. It shuts down in about a second and keeps the finished
@@ -224,7 +232,9 @@ To run your own build instead (development), copy the repository to the NAS, run
 
 ### Logs
 
-The Log tab keeps the newest 5,000 entries. A daily clean-up also drops expired title lookups and
+The Log tab keeps the newest 5,000 entries. A warning or error that repeats (an unreachable service
+polled every minute, say) is written once, then at most hourly with a count of the repeats, so it can't
+push everything else out. A daily clean-up also drops expired title lookups and
 cached file details for files that no longer exist. Each entry is also printed once to the app's
 TrueNAS log; TrueNAS doesn't rotate container logs, so MediaMan never prints encoder output there.
 

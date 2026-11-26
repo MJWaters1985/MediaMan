@@ -585,3 +585,65 @@ def test_an_early_skip_is_remembered(tmp_path):
     row = db.one("SELECT status, message, progress FROM jobs WHERE id=?", (jid,))
     assert row["status"] == "skipped" and row["progress"] == 1 and row["message"].startswith("predicted only 5%")
     assert transcode.skipped_before(str(src)).startswith("predicted only 5%")
+
+
+def test_queue_order_puts_the_biggest_savings_per_hour_first():
+    from app import db
+    db.x("DELETE FROM jobs WHERE status='queued'")
+    def item(path, hint, size):
+        db.x("INSERT OR REPLACE INTO items(path, transcode_hint, size, status) VALUES(?,?,?,'ok')", (path, hint, size))
+    def job(path, priority=0):
+        return db.x("INSERT INTO jobs(path,status,priority,created) VALUES(?,'queued',?,0)", (path, priority))
+    item("/q/dv-big.mkv", "hevc 2160p DV7 MEL+HDR10 → hevc (~90% smaller)", 90)
+    item("/q/hdr10-small.mkv", "hevc 2160p HDR10 → av1 (~91% smaller)", 40)
+    item("/q/hdr10-big.mkv", "hevc 2160p HDR10 → av1 (~91% smaller)", 80)
+    # an import: its item row is the download, and proposed_path is where it went in the library
+    db.x("INSERT INTO items(path, proposed_path, source, transcode_hint, size, status) VALUES(?,?,?,?,?,?)",
+         ("/dl/Import.mkv", "/q/imported.mkv", "import", "hevc 2160p HDR10 → av1", 60, "applied"))
+    a, b, c, d = job("/q/dv-big.mkv"), job("/q/hdr10-small.mkv"), job("/q/unknown.mkv"), job("/q/hdr10-big.mkv")
+    f = job("/q/imported.mkv")
+    e = job("/q/dv-big.mkv", priority=5)                 # a job's own priority still wins
+    order = lambda: [r["id"] for r in db.q("SELECT id FROM jobs WHERE status='queued' ORDER BY "
+                                           + transcode.queue_order_sql())]
+    config.update({"queue_order": "added"})
+    assert order() == [e, a, b, c, d, f]
+    config.update({"queue_order": "savings"})
+    assert order() == [e, d, f, b, c, a]                 # AV1 biggest first, unassessed, then HEVC
+    config.update({"queue_order": "added"})
+    db.x("DELETE FROM jobs WHERE status='queued'")
+
+
+def test_size_projections_are_logged_only_when_they_move(tmp_path):
+    from app import db
+    config.update({"min_savings_pct": 15})
+    src = tmp_path / "Steady.mkv"
+    src.write_bytes(b"x" * 1000)
+    wd = tmp_path / ".Steady.mediaman-work"
+    wd.mkdir()
+    prefix = list(range(0, 801, 8))                    # 100 frames of 8 bytes: 800 bytes of video
+    w = transcode.Worker()
+    jid = db.x("INSERT INTO jobs(path,status) VALUES(?,?)", (str(src), "running"))
+    count = lambda: db.one("SELECT COUNT(*) n FROM log WHERE msg LIKE 'Steady.mkv: after%'")["n"]
+    before = count()
+    for k, size in enumerate((10, 10, 10, 11, 40)):     # chunk sizes (bytes) for 10 frames (80 source bytes)
+        (wd / f"c{k:05d}.hevc").write_bytes(b"y" * size)
+        w._chunk_check(jid, str(src), str(wd), ".hevc", [10] * (k + 1), 10 * (k + 1), 100, prefix, {})
+    assert count() - before == 2                       # the first projection, then the one that moved
+
+
+def test_repeated_warnings_are_held_back(monkeypatch):
+    from app import db
+    clock = [5000.0]
+    monkeypatch.setattr(db.time, "time", lambda: clock[0])
+    rows = lambda: [r["msg"] for r in db.q("SELECT msg FROM log WHERE area='flaky' ORDER BY id")]
+    for _ in range(30):                                # every minute for half an hour
+        db.log("warn", "flaky", "service unreachable")
+        clock[0] += 60
+    db.log("warn", "flaky", "a different problem")
+    db.log("info", "flaky", "info is never held back")
+    db.log("info", "flaky", "info is never held back")
+    assert rows() == ["service unreachable", "a different problem", "info is never held back",
+                      "info is never held back"]
+    clock[0] += 3600
+    db.log("warn", "flaky", "service unreachable")
+    assert rows()[-1].startswith("service unreachable (also 29 more times in the last")

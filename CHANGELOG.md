@@ -2,6 +2,20 @@
 
 All notable changes to MediaMan. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.10.0 — 2026-11-26
+
+- New setting, Settings → Transcoding → *Queue order*. *added* (the default) keeps the order files were
+  queued in. *savings* runs the files that free the most space per hour first: files headed for AV1 before
+  those that need HEVC (Dolby Vision and HDR10+), which on the CPU save about a third as much per hour,
+  and the biggest first within each group. A job's own priority still comes first, new imports are ranked
+  from their import assessment, and the Transcode tab lists the queue in the order it will run.
+- Quieter log: a running encode logs its first size projection, then only changes of 3 points or more.
+  A warning or error that repeats (an unreachable service polled every minute) is written once, then at
+  most hourly with a count, so it can't push everything else out of the kept rows.
+- The bitrate-based "~90% smaller" guess is gone from the library and the queue: it said about 90% for
+  nearly every 4K film while results ranged from 5% to 91%. A job shows its saving once the quality search
+  has predicted it from real sample encodes.
+
 ## 1.9.0 — 2026-11-17
 
 - Files that won't save enough are now skipped early instead of after a whole encode. Grainy older films

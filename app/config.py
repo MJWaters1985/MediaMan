@@ -56,6 +56,7 @@ DEFAULTS: dict = {
     "min_savings_pct": 15,          # discard results that don't save at least this much
     "concurrent_jobs": 1,
     "overlap_finishing": True,      # start the next file while the last one is past encoding (joining, metadata, mux)
+    "queue_order": "added",         # added: oldest first. savings: the files that save the most per hour first
     "queue_paused": False,          # Pause queue also freezes the running job; survives restarts
     "resume_queue_on_startup": True,  # False: the queue comes back paused after a restart
     "transcode_window": "",         # e.g. "01:00-07:00"; empty = any time

@@ -339,10 +339,9 @@ def assess(s: dict, force: bool = False) -> tuple[bool, str]:
             return False, f"{label} — already efficient"
         if rank_s >= 1 and 0 < bpp < 0.04:
             return False, f"{label} — already low bitrate"
-    tgt_bpp = {"hevc": 0.06, "av1": 0.045, "h264": 0.085}[tgt] * (0.6 if s.get("height", 0) > 1800 else 1)
-    est = 1 - (tgt_bpp / bpp) if bpp else 0
-    est_txt = f" (~{int(est * 100)}% smaller)" if est > 0.05 else ""
-    return True, f"{label} → {tgt}{' ' + str(max_h) + 'p' if downscale else ''}{est_txt}"
+    # no size guess here: from the bitrate alone it said ~90% for nearly every 4K film (results: 5–91%).
+    # The quality search predicts it from real sample encodes and adds it to the job.
+    return True, f"{label} → {tgt}{' ' + str(max_h) + 'p' if downscale else ''}"
 
 
 def _profile_args(backend: str, codec: str, depth: int) -> list[str]:
@@ -685,6 +684,23 @@ def _stat(path: str) -> tuple[int, float] | None:
         return None
 
 
+def queue_order_sql() -> str:
+    """ORDER BY for queued jobs (from the jobs table). A job's own priority always comes first. With
+    queue_order "savings", files headed for AV1 go before HEVC ones: on the CPU an AV1 encode is about three
+    times faster per GB saved (HEVC is what Dolby Vision and HDR10+ need). Within each group the biggest file
+    goes first, since the saving grows with the size. A new import is ranked from the assessment made when it
+    was imported; files nothing has assessed yet sit in between."""
+    if config.get("queue_order") == "savings":
+        def item(col):      # the library scan's row, else the import that put the file there
+            return (f"COALESCE((SELECT {col} FROM items i WHERE i.path=jobs.path), "
+                    f"(SELECT {col} FROM items i WHERE i.proposed_path=jobs.path AND i.source='import' "
+                    f"ORDER BY i.id DESC LIMIT 1))")
+        hint = item("transcode_hint")
+        return (f"jobs.priority DESC, CASE WHEN {hint} LIKE '%→ av1%' THEN 0 WHEN {hint} IS NULL THEN 1 ELSE 2 END, "
+                f"COALESCE({item('size')}, 0) DESC, jobs.id")
+    return "jobs.priority DESC, jobs.id"
+
+
 def remember_skip(path: str, reason: str):
     st = _stat(path)
     if st:
@@ -747,6 +763,7 @@ class Worker:
         self.finishing: set[int] = set()  # running jobs past encoding (they no longer hold a queue slot)
         self.times: dict[int, dict] = {}  # seconds spent in each step, per running job (saved in jobs.steps)
         self.peak: dict[int, tuple] = {}  # running job → (work folder, new file, peak disk space it needs)
+        self.projected: dict[int, float] = {}  # running job → the size projection last written to the log
 
     @property
     def paused(self) -> bool:
@@ -894,7 +911,7 @@ class Worker:
         slots = self.free_slots()
         if slots <= 0:
             return
-        for job in db.q("SELECT * FROM jobs WHERE status='queued' ORDER BY priority DESC, id LIMIT ?", (slots,)):
+        for job in db.q("SELECT * FROM jobs WHERE status='queued' ORDER BY " + queue_order_sql() + " LIMIT ?", (slots,)):
             db.x("UPDATE jobs SET status='running', started=?, progress=0, message=NULL WHERE id=?",
                  (time.time(), job["id"]))
             self.tasks[job["id"]] = asyncio.create_task(self.run(job))
@@ -953,6 +970,7 @@ class Worker:
             self.last.pop(jid, None)
             self.finishing.discard(jid)
             self.peak.pop(jid, None)
+            self.projected.pop(jid, None)
             self.times.pop(jid, None)
             self.stage.pop(jid, None)
 
@@ -1320,8 +1338,9 @@ class Worker:
         enc = sum(e.stat().st_size for e in _scandir(wd) if re.fullmatch(r"c\d{5}" + re.escape(ext), e.name))
         orig_size = os.path.getsize(path)
         saving = predicted_saving(orig_size, prefix[-1], enc / src)
-        n = len(chunks)
-        if n == 2 or n % 10 == 0:
+        last = self.projected.get(jid)
+        if last is None or abs(saving - last) >= PROJECTION_LOG_STEP:     # the first, then only real changes
+            self.projected[jid] = saving
             db.log("info", "transcode", f"{os.path.basename(path)}: after {share * 100:.0f}% of the film the "
                                         f"chunks project ~{saving * 100:.0f}% smaller")
         return early_skip_reason(saving, chunk_margin(share), f"after encoding {share * 100:.0f}% of the film")
@@ -1720,6 +1739,7 @@ def expected_output(s: dict, codec: str, orig_size: int) -> int:
 EARLY_MARGIN_SEARCH = 0.03
 EARLY_MARGIN_CHUNKS = (0.005, 0.035)     # (margin at the end, extra margin at the start), shrinking linearly
 EARLY_FIRST_CHECK = 0.05                 # chunked encodes are first projected after this share of the film
+PROJECTION_LOG_STEP = 0.03               # later projections are logged only when they move this much
 
 
 def source_video_bytes(s: dict, orig_size: int) -> int:

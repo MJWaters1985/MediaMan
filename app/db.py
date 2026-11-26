@@ -94,11 +94,27 @@ def x(sql: str, args=()) -> int:
 
 
 LOG_KEEP = 5000          # log rows kept in the database (the Log tab)
+REPEAT_WINDOW = 3600     # an identical warning or error is written at most once per this many seconds
 _log_count = 0
+_repeats: dict[tuple, list] = {}    # (level, area, msg) → [when it was last written, times held back since]
 
 
 def log(level: str, area: str, msg: str) -> None:
     global _log_count
+    if level in ("warn", "error"):
+        # a problem that repeats every poll (an unreachable service, a refused login) would otherwise flood the
+        # log and push everything else out of the kept rows: write it once, then hourly with a count
+        now, key = time.time(), (level, area, msg)
+        seen = _repeats.get(key)
+        if seen and now - seen[0] < REPEAT_WINDOW:
+            seen[1] += 1
+            return
+        if seen and seen[1]:
+            msg += f" (also {seen[1]} more time{'s' if seen[1] != 1 else ''} in the last {(now - seen[0]) / 60:.0f} min)"
+        _repeats[key] = [now, 0]
+        if len(_repeats) > 1000:
+            for k in [k for k, v in _repeats.items() if now - v[0] >= REPEAT_WINDOW]:
+                del _repeats[k]
     # one line per event on stdout too (TrueNAS's app logs). Docker on TrueNAS doesn't rotate container logs,
     # so nothing chatty goes here: ffmpeg's output stays in memory and only a summary is logged.
     print(f"[{level}] {area}: {msg[:2000]}", flush=True)
